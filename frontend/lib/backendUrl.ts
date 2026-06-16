@@ -21,6 +21,18 @@ export function browserApiBase(): string {
   return "/api";
 }
 
+/** Long scans (analyze/prices) — bypass Next.js proxy to avoid 5–10 min idle timeouts. */
+export function browserDirectBackendBase(): string {
+  if (typeof window === "undefined") {
+    return serverBackendApiBase();
+  }
+  const pub = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (pub) {
+    return pub.replace(/\/$/, "").replace("://localhost", "://127.0.0.1");
+  }
+  return "http://127.0.0.1:3001/api";
+}
+
 /** Saved/Reserved library — always same-origin /api proxy (reliable on Windows/Docker). */
 export function browserLibraryApiBase(): string {
   if (typeof window === "undefined") {

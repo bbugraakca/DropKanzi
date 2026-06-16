@@ -439,34 +439,26 @@ export function rememberSellerSearches(
     if (!seller) return;
     const key = seller.toLowerCase();
     const prev = map.get(key);
-    const isCancel = /cancel/i.test(String(e.error ?? ""));
-    const incomingEmpty = (e.total ?? 0) === 0 && (e.matched ?? 0) === 0;
-    const keepPrevStats =
-      isCancel || (incomingEmpty && (prev?.total ?? 0) > 0 && e.status === "failed");
     map.set(key, {
       seller,
       daysBack: e.daysBack,
       lastUsed: now - i,
       sellerInput: e.sellerInput ?? prev?.sellerInput,
-      matched: keepPrevStats ? prev?.matched : (e.matched ?? prev?.matched),
-      total: keepPrevStats ? prev?.total : (e.total ?? prev?.total),
+      matched: e.matched ?? prev?.matched,
+      total: e.total ?? prev?.total,
       ebaySellerId: e.ebaySellerId ?? prev?.ebaySellerId,
-      status: keepPrevStats ? prev?.status : (e.status ?? prev?.status),
-      error: keepPrevStats ? prev?.error : (e.error ?? prev?.error),
-      costUsd: keepPrevStats ? prev?.costUsd : (e.costUsd ?? prev?.costUsd),
-      costBytes: keepPrevStats ? prev?.costBytes : (e.costBytes ?? prev?.costBytes),
-      costRequests: keepPrevStats ? prev?.costRequests : (e.costRequests ?? prev?.costRequests),
-      cached: keepPrevStats ? prev?.cached : (e.cached ?? prev?.cached),
-      costStages: keepPrevStats ? prev?.costStages : (e.costStages ?? prev?.costStages),
-      matchTitlesAttempted: keepPrevStats
-        ? prev?.matchTitlesAttempted
-        : (e.matchTitlesAttempted ?? prev?.matchTitlesAttempted),
-      matchTitlesSkipped: keepPrevStats
-        ? prev?.matchTitlesSkipped
-        : (e.matchTitlesSkipped ?? prev?.matchTitlesSkipped),
-      serpLookups: keepPrevStats ? prev?.serpLookups : (e.serpLookups ?? prev?.serpLookups),
-      serpProxy: keepPrevStats ? prev?.serpProxy : (e.serpProxy ?? prev?.serpProxy),
-      serpDirect: keepPrevStats ? prev?.serpDirect : (e.serpDirect ?? prev?.serpDirect),
+      status: e.status ?? prev?.status,
+      error: e.error ?? prev?.error,
+      costUsd: e.costUsd ?? prev?.costUsd,
+      costBytes: e.costBytes ?? prev?.costBytes,
+      costRequests: e.costRequests ?? prev?.costRequests,
+      cached: e.cached ?? prev?.cached,
+      costStages: e.costStages ?? prev?.costStages,
+      matchTitlesAttempted: e.matchTitlesAttempted ?? prev?.matchTitlesAttempted,
+      matchTitlesSkipped: e.matchTitlesSkipped ?? prev?.matchTitlesSkipped,
+      serpLookups: e.serpLookups ?? prev?.serpLookups,
+      serpProxy: e.serpProxy ?? prev?.serpProxy,
+      serpDirect: e.serpDirect ?? prev?.serpDirect,
     });
   });
   const all = Array.from(map.values()).sort((a, b) => b.lastUsed - a.lastUsed);
@@ -510,65 +502,6 @@ export function importSellersToWatchlist(
 }
 
 /** Move a finished queue run into seller history (not shown in the live queue). */
-/** Pull latest successful sold-scan stats from server jobs into watchlist (fixes cancel/empty overwrites). */
-export function syncWatchlistFromDoneJobs(
-  jobs: Array<{
-    seller: string;
-    daysBack: number;
-    status: string;
-    scanType: string;
-    updatedAt: string;
-    progress?: unknown;
-    result?: unknown;
-  }>
-): boolean {
-  const best = new Map<string, (typeof jobs)[number]>();
-  for (const j of jobs) {
-    if (j.status !== "done" || j.scanType !== "sold") continue;
-    const key = j.seller.toLowerCase();
-    const cur = best.get(key);
-    if (!cur || new Date(j.updatedAt).getTime() > new Date(cur.updatedAt).getTime()) {
-      best.set(key, j);
-    }
-  }
-  const patches: ArchiveSellerScanInput[] = [];
-  for (const j of Array.from(best.values())) {
-    const summary = ((j.progress as { summary?: Record<string, unknown> } | null)?.summary ??
-      {}) as Record<string, unknown>;
-    const result = (j.result ?? {}) as {
-      total?: number;
-      matched?: number;
-      proxyCostUsd?: number;
-    };
-    const total = Number(summary.total_listings ?? result.total ?? 0);
-    if (total <= 0) continue;
-    const hist = readSellerHistory().find((h) => h.seller.toLowerCase() === j.seller.toLowerCase());
-    const histBad =
-      !hist ||
-      /cancel/i.test(String(hist.error ?? "")) ||
-      ((hist.total ?? 0) === 0 && (hist.matched ?? 0) === 0) ||
-      (hist.total ?? 0) < total;
-    if (!histBad) continue;
-    patches.push({
-      seller: j.seller,
-      daysBack: j.daysBack,
-      matched: Number(summary.matched_to_amazon ?? result.matched ?? 0),
-      total,
-      status: "done",
-      error: undefined,
-      costUsd: Number(summary.proxy_cost_usd ?? result.proxyCostUsd ?? 0),
-      costBytes: Number(summary.proxy_bytes ?? 0),
-      costRequests: Number(summary.proxy_requests ?? 0),
-      costStages: summary.proxy_stages as ArchiveSellerScanInput["costStages"],
-      matchTitlesAttempted: Number(summary.match_groups_attempted ?? 0),
-      matchTitlesSkipped: Number(summary.match_groups_skipped ?? 0),
-    });
-  }
-  if (patches.length === 0) return false;
-  rememberSellerSearches(patches);
-  return true;
-}
-
 export function archiveSellerScan(entry: ArchiveSellerScanInput): StoredSellerSearch[] {
   return rememberSellerSearches([entry]);
 }

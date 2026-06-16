@@ -33,12 +33,8 @@ from amazon_search import (
     clean_query,
     search_amazon_candidates,
     _search_queries,
-    extract_model_tokens,
 )
-from pack_utils import extract_pack_count
-from llm_provider import get_llm_client
-from vector_cache import lookup_similar, save_match
-from asin_util import is_plausible_asin, is_ebay_detail_asin, reject_suspicious_ebay_detail_dupes
+from asin_util import is_plausible_asin
 from image_match import IMAGE_CHECK_MAX_TEXT, image_match as siglip_match
 
 logger = logging.getLogger("pricehawk.amazon_matcher")
@@ -56,16 +52,26 @@ _MPN_NOISE = frozenset(
     {"FAST", "SHIP", "SHIPS", "FREE", "NEW", "USED", "OPEN", "BOX", "SEALED"}
 )
 
+_claude_client: Any = None
+
+
 def _claude_enabled() -> bool:
-    provider, _client = get_llm_client()
-    return provider == "claude"
+    return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
 
 
 def _get_claude() -> Any | None:
-    provider, client = get_llm_client()
-    if provider != "claude":
+    global _claude_client
+    if not _claude_enabled():
         return None
-    return client
+    if _claude_client is None:
+        try:
+            import anthropic
+
+            _claude_client = anthropic.AsyncAnthropic()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Anthropic client unavailable: %s", exc)
+            return None
+    return _claude_client
 
 
 def _parse_json_response(text: str) -> dict:
@@ -80,23 +86,6 @@ FINDER_VISION_MATCH = os.getenv("FINDER_VISION_MATCH", "false").lower() in ("1",
 FINDER_MAX_SERP_QUERIES = int(os.getenv("FINDER_MAX_SERP_QUERIES", "2"))
 FINDER_MAX_MATCH_GROUPS = int(os.getenv("FINDER_MAX_MATCH_GROUPS", "600"))
 FINDER_SERP_CANDIDATES = int(os.getenv("FINDER_SERP_CANDIDATES", "8"))
-FINDER_LLM_BATCH_SIZE = int(os.getenv("FINDER_LLM_BATCH_SIZE", "25"))
-def _identifier_gate_ok(ebay_title: str, amazon_title: str) -> bool:
-    e = extract_model_tokens(ebay_title)
-    a = extract_model_tokens(amazon_title)
-    if not e:
-        return True
-    return e.issubset(a)
-
-
-def _dynamic_threshold(title: str, has_exact_partno: bool) -> float:
-    t = title.lower()
-    if any(k in t for k in ("case", "cover", "protector", "compatible with", "fits for", "replacement for")):
-        return 0.90
-    if has_exact_partno and any(k in t for k in ("oem", "genuine", "part number", "interchange")):
-        return 0.75
-    return 0.80
-
 
 _match_method_stats: dict[str, int] = {
     "regex": 0,
@@ -470,45 +459,6 @@ Return ONLY valid JSON, no markdown:
         }
 
 
-async def claude_clean_titles_batch(titles: list[str], batch_size: int = FINDER_LLM_BATCH_SIZE) -> list[dict]:
-    client = _get_claude()
-    if client is None or not titles:
-        return [await claude_clean_title(t) for t in titles]
-    out: list[dict] = []
-    for i in range(0, len(titles), max(1, batch_size)):
-        chunk = titles[i : i + max(1, batch_size)]
-        numbered = "\n".join(f"{idx+1}. {t}" for idx, t in enumerate(chunk))
-        prompt = (
-            "Convert each eBay title to clean Amazon search info. "
-            "Return only JSON array with objects {clean_title,search_queries,brand,asin_if_visible}.\n"
-            f"Titles:\n{numbered}"
-        )
-        try:
-            resp = await client.messages.create(
-                model=_CLAUDE_MODEL,
-                max_tokens=1200,
-                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-            )
-            arr = json.loads(resp.content[0].text.strip())
-            if not isinstance(arr, list):
-                raise ValueError("batch response not array")
-            for idx, title in enumerate(chunk):
-                obj = arr[idx] if idx < len(arr) and isinstance(arr[idx], dict) else {}
-                clean = obj.get("clean_title") or clean_query(title)
-                out.append(
-                    {
-                        "clean_title": clean,
-                        "search_queries": obj.get("search_queries") or _search_queries(title) or [clean],
-                        "brand": obj.get("brand"),
-                        "asin_if_visible": obj.get("asin_if_visible"),
-                    }
-                )
-        except Exception:
-            for title in chunk:
-                out.append(await claude_clean_title(title))
-    return out
-
-
 async def match_by_image_vision(
     img_session: AsyncSession,
     image_url: str,
@@ -602,7 +552,6 @@ async def _match_listing_inner(
     title = listing.get("title") or ""
     image_url = listing.get("image") or ""
     clean = clean_query(title)
-    listing["ebay_pack_count"] = extract_pack_count(title)
 
     base: dict = {
         "clean_title": clean,
@@ -627,20 +576,6 @@ async def _match_listing_inner(
             clean[:60],
         )
 
-    vhit = lookup_similar(clean, min_cosine=0.93)
-    if vhit and _valid_asin(str(vhit.get("asin") or "")):
-        cand_title = str(vhit.get("amazon_title") or "")
-        if _identifier_gate_ok(title, cand_title):
-            return _apply_match(
-                listing,
-                {
-                    **base,
-                    "amazon_asin": str(vhit["asin"]).upper(),
-                    "match_confidence": float(vhit.get("confidence") or 0.93),
-                    "match_method": "vector_cache",
-                    "amazon_title": cand_title.lower(),
-                },
-            )
     if listing.get("amazon_asin") and _valid_asin(listing["amazon_asin"]):
         hit = {
             **base,
@@ -670,17 +605,15 @@ async def _match_listing_inner(
     if listing_id:
         detail = await get_listing_details(str(listing_id), serp_session)
         detail_asin = detail.get("asin")
-        detail_source = str(detail.get("source") or "")
-        if detail_asin and is_ebay_detail_asin(detail_asin, source=detail_source):
-            conf = 0.99 if detail_source == "dp_link" else 0.0
+        if detail_asin and _valid_asin(detail_asin):
             hit = {
                 **base,
                 "amazon_asin": detail_asin.upper(),
-                "match_confidence": conf,
+                "match_confidence": 0.99,
                 "match_method": "ebay_detail",
             }
             match_cache.set_match(clean, hit)
-            _record_match("ebay_detail", proxy_used=False, bytes_used=0, confidence=conf)
+            _record_match("ebay_detail", proxy_used=False, bytes_used=0, confidence=0.99)
             return _apply_match(listing, hit)
 
     for id_type in ("apple_mpn", "samsung_model", "mpn", "upc"):
@@ -700,11 +633,7 @@ async def _match_listing_inner(
             match_cache.set_match(clean, mpn_hit)
             return _apply_match(listing, {**base, **mpn_hit})
 
-    prefetched = listing.get("_prefetched_claude")
-    if isinstance(prefetched, dict):
-        claude_data = prefetched
-    else:
-        claude_data = await claude_clean_title(title, image_url or None)
+    claude_data = await claude_clean_title(title, image_url or None)
     clean_title = claude_data.get("clean_title") or clean
     base["clean_title"] = clean_title
     search_queries = claude_data.get("search_queries") or _search_queries(title) or [clean_title]
@@ -731,21 +660,6 @@ async def _match_listing_inner(
         original_title=title,
     )
     if search_hit and _success(search_hit):
-        amazon_title = str(search_hit.get("amazon_title") or "")
-        if not _identifier_gate_ok(title, amazon_title):
-            search_hit["amazon_asin"] = None
-            search_hit["match_confidence"] = 0.0
-        else:
-            ebay_pack = float(listing.get("ebay_pack_count") or 1)
-            amazon_pack = float(extract_pack_count(amazon_title))
-            search_hit["amazon_pack_count"] = amazon_pack
-            threshold = _dynamic_threshold(title, bool(extract_identifiers(title)))
-            if float(search_hit.get("match_confidence") or 0) < threshold:
-                search_hit["amazon_asin"] = None
-                search_hit["match_confidence"] = 0.0
-            elif amazon_pack > 0 and (ebay_pack / amazon_pack) > 4:
-                search_hit["amazon_asin"] = None
-                search_hit["match_confidence"] = 0.0
         match_cache.set_match(clean, search_hit)
         _record_match(
             str(search_hit.get("match_method") or "search"),
@@ -753,16 +667,7 @@ async def _match_listing_inner(
             bytes_used=0,
             confidence=float(search_hit.get("match_confidence") or 0),
         )
-        out = _apply_match(listing, {**base, **search_hit})
-        if out.get("amazon_asin"):
-            save_match(
-                clean,
-                str(out.get("amazon_asin")),
-                str(out.get("amazon_title") or ""),
-                float(out.get("match_confidence") or 0),
-                str(out.get("match_method") or "search"),
-            )
-        return out
+        return _apply_match(listing, {**base, **search_hit})
 
     if image_url:
         vision_hit = await match_by_image_vision(
@@ -870,10 +775,6 @@ async def match_listings_batch(
     cap = max_groups if max_groups is not None else FINDER_MAX_MATCH_GROUPS
     keys = all_keys[:cap] if cap > 0 and len(all_keys) > cap else all_keys
     representatives = [listings[groups[k][0]] for k in keys]
-    if FINDER_CLAUDE_MATCH and representatives:
-        batch_clean = await claude_clean_titles_batch([r.get("title", "") for r in representatives])
-        for rep, cleaned in zip(representatives, batch_clean):
-            rep["_prefetched_claude"] = cleaned
 
     logger.info(
         "total_listings=%d unique_titles=%d groups_attempted=%d groups_skipped=%d",
@@ -926,14 +827,6 @@ async def match_listings_batch(
                 return res
 
         matched_reps = await asyncio.gather(*[_match_rep(r) for r in representatives])
-
-    matched_reps = reject_suspicious_ebay_detail_dupes(list(matched_reps))
-    rejected = sum(1 for m in matched_reps if m.get("match_method") == "ebay_detail_rejected")
-    if rejected:
-        logger.warning(
-            "Rejected %d ebay_detail match(es) — same ASIN on 3+ listings (template noise)",
-            rejected,
-        )
 
     rep_by_key = {
         clean_query(rep.get("title", "")).lower(): matched

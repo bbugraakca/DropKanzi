@@ -13,12 +13,11 @@ import { SavedProductsPanel } from "@/components/product-finder/SavedProductsPan
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Button } from "@/components/ui/Button";
 import {
-  postPfScan,
-  getPfScanJobs,
-  cancelPfScan,
-  type PfScanJob,
+  analyzeSeller,
+  analyzeActiveSeller,
   getStoreSettings,
   importFoundFromAnalysis,
+  mergeFoundProducts,
   removeFoundProducts,
   clearFoundProducts,
   fetchFoundStats,
@@ -42,6 +41,14 @@ import {
 import {
   enrichListingsProfit,
 } from "@/lib/productFinderProfit";
+import { formatBytes } from "@/lib/formatBytes";
+import { addProxyTotals } from "@/lib/productFinderProxy";
+import {
+  filterAcceptedMatches,
+  isAcceptedMatch,
+  countAcceptedMatches,
+  countAcceptedPricesLoaded,
+} from "@/lib/productFinderMatch";
 import { parseEbaySellerInput } from "@/lib/parseEbaySellerInput";
 import {
   SAVED_KEY,
@@ -52,15 +59,16 @@ import {
   activeRemoveKeys,
   readDeletedFoundKeys,
   writeDeletedFoundKeys,
+  readQueueLocal,
   dedupeSavedByListingKey,
   mergeListing,
   normalizeAsin,
+  writeQueueLocal,
   writeSavedLocal,
   scheduleWriteSavedLocal,
   writeReservedLocal,
   scheduleWriteReservedLocal,
   archiveSellerScan,
-  syncWatchlistFromDoneJobs,
   rememberSellerSearches,
   uniqueSellerHistory,
   WEEKLY_REFRESH_DAYS,
@@ -69,6 +77,12 @@ import {
 import { useAppStore } from "@/lib/store/appStore";
 import { cn } from "@/lib/utils";
 
+const MAX_PARALLEL_SELLERS = 1;
+const SELLER_COOLDOWN_MS = 400;
+const EMPTY_RETRY_DELAY_MS = 2500;
+const EMPTY_RETRY_MAX = 2;
+const NETWORK_RETRY_MAX = 3;
+const NETWORK_RETRY_DELAY_MS = 6000;
 const PF_TAB_STORAGE_KEY = "pf_active_tab";
 
 type PfTab = "queue" | "sellers" | "found" | "active" | "saved" | "reserved";
@@ -79,6 +93,13 @@ type ConfirmAction =
   | { kind: "clearReserved"; count: number }
   | { kind: "returnToFound"; listings: ProductFinderListing[] }
   | { kind: "restoreArchive"; source: PfArchiveSource; count: number };
+
+function isRetryableAnalyzeError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /api connection failed|cannot reach api|failed to fetch|fetch failed|network|502|503|504|scraper failed|scraper connection|econnrefused|enotfound|socket hang up|connection lost|backend unreachable|und_err|other side closed|siglip warmup/i.test(
+    msg
+  );
+}
 
 function normalizeSellerName(raw: string): string {
   return parseEbaySellerInput(raw).seller;
@@ -164,14 +185,12 @@ export default function ProductFinderPage() {
   const bumpListingsVersion = useAppStore((s) => s.bumpListingsVersion);
 
   const [queueView, setQueueView] = useState<QueueItem[]>([]);
-  const queueMapRef = useRef<Map<string, QueueItem>>(new Map());
-  const archivedJobIdsRef = useRef<Set<string>>(new Set());
   const [foundTotal, setFoundTotal] = useState(0);
   const [foundRefreshKey, setFoundRefreshKey] = useState(0);
   const [activeTotal, setActiveTotal] = useState(0);
   const [activeRefreshKey, setActiveRefreshKey] = useState(0);
   const [focusActiveSeller, setFocusActiveSeller] = useState<string | null>(null);
-  const [scanningActiveSeller] = useState<string | null>(null);
+  const [scanningActiveSeller, setScanningActiveSeller] = useState<string | null>(null);
   const tabRef = useRef<PfTab>("found");
   const pendingFoundRefreshRef = useRef(false);
   const pendingActiveRefreshRef = useRef(false);
@@ -355,9 +374,15 @@ export default function ProductFinderPage() {
     Partial<Record<PfArchiveSource, { count: number; archivedAt: string | null }>>
   >({});
 
+  const queueRef = useRef<QueueItem[]>([]);
+  const activeRef = useRef(0);
+  const queuePausedRef = useRef(false);
+  const pumpRef = useRef<() => void>(() => {});
+  const storeIdRef = useRef(storeId);
   const storeSettingsRef = useRef(storeSettings);
   const savedRef = useRef(saved);
   const reservedRef = useRef(reserved);
+  storeIdRef.current = storeId;
   storeSettingsRef.current = storeSettings;
   savedRef.current = saved;
   reservedRef.current = reserved;
@@ -372,9 +397,11 @@ export default function ProductFinderPage() {
   }, [reserved]);
 
   const syncQueue = useCallback(() => {
-    const snapshot = Array.from(queueMapRef.current.values());
-    snapshot.sort((a, b) => a.id.localeCompare(b.id));
+    const snapshot = [...queueRef.current];
     setQueueView(snapshot);
+    writeQueueLocal(
+      snapshot.filter((it) => it.status === "queued" || it.status === "running")
+    );
   }, []);
 
   const archiveAndRemoveQueueItem = useCallback((item: QueueItem) => {
@@ -399,100 +426,58 @@ export default function ProductFinderPage() {
       serpProxy: item.serpProxy,
       serpDirect: item.serpDirect,
     });
-    queueMapRef.current.delete(item.id);
+    queueRef.current = queueRef.current.filter((it) => it.id !== item.id);
     setPastSellersRefresh((n) => n + 1);
   }, []);
 
-  // Server is source of truth for queue.
+  // Restore active queue only; finished runs live under Past sellers.
   useEffect(() => {
-    let stop = false;
-    const refresh = async () => {
-      const jobs = (await getPfScanJobs()).jobs ?? [];
-      if (stop) return;
-      for (const j of jobs) {
-        const existing = queueMapRef.current.get(j.id);
-        const summary = ((j.progress as { summary?: Record<string, unknown> } | null)?.summary ??
-          {}) as Record<string, unknown>;
-        const result = (j.result ?? {}) as {
-          total?: number;
-          matched?: number;
-          proxyCostUsd?: number;
-        };
-        const totalListings = Number(
-          summary.total_listings ?? result.total ?? existing?.total ?? 0
-        );
-        const ebayMsg =
-          typeof summary.ebay_message === "string" ? summary.ebay_message.trim() : "";
-        const isCanceled = j.status === "canceled";
-        let status: QueueItem["status"] =
-          j.status === "active"
-            ? "running"
-            : j.status === "queued"
-              ? "queued"
-              : j.status === "done"
-                ? "done"
-                : isCanceled
-                  ? "failed"
-                  : "failed";
-        let error: string | undefined = j.error ?? undefined;
-        if (j.status === "done" && totalListings === 0 && ebayMsg) {
-          status = "failed";
-          error = ebayMsg;
-        }
-        const proxyStages = summary.proxy_stages as QueueItem["costStages"];
-        const item: QueueItem = {
-          id: j.id,
-          seller: j.seller,
-          daysBack: j.daysBack,
-          scanMode: j.scanType as "sold" | "active",
-          status,
-          matched: Number(summary.matched_to_amazon ?? result.matched ?? existing?.matched ?? 0),
-          total: totalListings,
-          costUsd: Number(summary.proxy_cost_usd ?? result.proxyCostUsd ?? existing?.costUsd ?? 0),
-          costBytes: Number(summary.proxy_bytes ?? existing?.costBytes ?? 0),
-          costRequests: Number(summary.proxy_requests ?? existing?.costRequests ?? 0),
-          costStages: proxyStages ?? existing?.costStages,
-          matchAttempted: Number(summary.match_groups_attempted ?? existing?.matchAttempted ?? 0),
-          matchSkipped: Number(summary.match_groups_skipped ?? existing?.matchSkipped ?? 0),
-          ebaySellerId:
-            typeof summary.ebay_seller_id === "string"
-              ? summary.ebay_seller_id
-              : existing?.ebaySellerId,
-          ebayMessage: ebayMsg || existing?.ebayMessage,
-          error,
-          forceRefresh: j.forceRefresh || undefined,
-        };
-        queueMapRef.current.set(j.id, item);
-        if (
-          (j.status === "done" || j.status === "failed" || j.status === "canceled") &&
-          !archivedJobIdsRef.current.has(j.id)
-        ) {
-          archivedJobIdsRef.current.add(j.id);
-          if (isCanceled) {
-            queueMapRef.current.delete(j.id);
-          } else if (item.status === "done" || item.status === "failed") {
-            archiveAndRemoveQueueItem(item);
-            if (item.scanMode === "active") bumpActive();
-            else bumpFound();
-          } else {
-            queueMapRef.current.delete(j.id);
-          }
-        }
-      }
-      if (syncWatchlistFromDoneJobs(jobs)) {
-        setPastSellersRefresh((n) => n + 1);
-      }
-      syncQueue();
-    };
-    void refresh();
-    const poll = window.setInterval(() => {
-      void refresh().catch(() => undefined);
-    }, 5000);
-    return () => {
-      stop = true;
-      window.clearInterval(poll);
-    };
-  }, [syncQueue, archiveAndRemoveQueueItem, bumpActive, bumpFound]);
+    const stored = readQueueLocal();
+    const finished = stored.filter(
+      (it) => it.status === "done" || it.status === "failed"
+    );
+    if (finished.length > 0) {
+      rememberSellerSearches(
+        finished.map((it) => ({
+          seller: it.seller,
+          daysBack: it.daysBack,
+          matched: it.matched,
+          total: it.total,
+          status: it.status as "done" | "failed",
+          error: it.error,
+          costUsd: it.costUsd,
+          costBytes: it.costBytes,
+          costRequests: it.costRequests,
+          cached: it.cached,
+          costStages: it.costStages,
+          matchTitlesAttempted: it.matchAttempted,
+          matchTitlesSkipped: it.matchSkipped,
+          serpLookups: it.serpLookups,
+          serpProxy: it.serpProxy,
+          serpDirect: it.serpDirect,
+        }))
+      );
+      setPastSellersRefresh((n) => n + 1);
+    }
+
+    const active = stored.filter(
+      (it) =>
+        isValidSellerName(it.seller) &&
+        (it.status === "queued" || it.status === "running")
+    );
+    if (active.length === 0 && finished.length === 0) return;
+
+    queueRef.current = active.map((it) =>
+      it.status === "running" ? { ...it, status: "queued" as const } : it
+    );
+    syncQueue();
+
+    const pending = queueRef.current.some((it) => it.status === "queued");
+    if (pending) {
+      const t = window.setTimeout(() => pumpRef.current(), 400);
+      return () => window.clearTimeout(t);
+    }
+  }, [syncQueue]);
 
   const deletedFoundRef = useRef(readDeletedFoundKeys());
 
@@ -1183,81 +1168,287 @@ export default function ProductFinderPage() {
 
   const activeArchive = activeArchiveSource ? archiveHint[activeArchiveSource] : null;
 
-  useEffect(() => {
-    const streams = new Map<string, EventSource>();
-    const wire = (job: PfScanJob) => {
-      if (streams.has(job.id)) return;
-      const es = new EventSource(`/api/pf-scan/stream?jobId=${encodeURIComponent(job.id)}`);
-      es.addEventListener("progress", (ev) => {
+  const analyzeSellerWithRetry = useCallback(
+    async (
+      seller: string,
+      daysBack: number,
+      force: boolean,
+      fetchPrices: boolean,
+      onRetry?: (attempt: number) => void
+    ) => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
         try {
-          const payload = JSON.parse((ev as MessageEvent).data) as Record<string, unknown>;
-          const existing = queueMapRef.current.get(job.id) ?? {
-            id: job.id,
-            seller: job.seller,
-            daysBack: job.daysBack,
-            scanMode: job.scanType,
-            status: "queued" as const,
-          };
-          const summary = (payload.summary as Record<string, unknown> | undefined) ?? {};
-          const statusRaw = String(payload.status ?? job.status);
-          const next: QueueItem = {
-            ...existing,
-            seller: job.seller,
-            daysBack: job.daysBack,
-            scanMode: job.scanType,
-            status:
-              statusRaw === "active"
-                ? "running"
-                : statusRaw === "queued"
-                  ? "queued"
-                  : statusRaw === "done"
-                    ? "done"
-                    : "failed",
-            matched: Number(summary.matched_to_amazon ?? existing.matched ?? 0),
-            total: Number(summary.total_listings ?? existing.total ?? 0),
-            costUsd: Number(summary.proxy_cost_usd ?? existing.costUsd ?? 0),
-            error: (payload.error as string | undefined) ?? existing.error,
-            forceRefresh: job.forceRefresh || undefined,
-          };
-          queueMapRef.current.set(job.id, next);
-          if (statusRaw === "canceled") {
-            queueMapRef.current.delete(job.id);
-            streams.get(job.id)?.close();
-            streams.delete(job.id);
-          } else if (next.status === "done" || next.status === "failed") {
-            archiveAndRemoveQueueItem(next);
-            if (next.scanMode === "active") bumpActive();
-            else bumpFound();
-            streams.get(job.id)?.close();
-            streams.delete(job.id);
+          return await analyzeSeller(
+            seller,
+            daysBack,
+            storeIdRef.current,
+            force,
+            fetchPrices
+          );
+        } catch (err) {
+          lastErr = err;
+          if (!isRetryableAnalyzeError(err) || attempt === NETWORK_RETRY_MAX) {
+            throw err;
           }
-          syncQueue();
-        } catch {
-          // ignore malformed progress packet
+          onRetry?.(attempt + 1);
+          await new Promise((r) =>
+            setTimeout(r, NETWORK_RETRY_DELAY_MS * (attempt + 1))
+          );
         }
-      });
-      streams.set(job.id, es);
-    };
-
-    for (const item of queueView) {
-      if (item.status === "queued" || item.status === "running") {
-        wire({
-          id: item.id,
-          tenantId: "default",
-          seller: item.seller,
-          scanType: item.scanMode === "active" ? "active" : "sold",
-          daysBack: item.daysBack,
-          forceRefresh: Boolean(item.forceRefresh),
-          status: item.status === "running" ? "active" : "queued",
-          createdAt: "",
-          updatedAt: "",
-        });
       }
+      throw lastErr;
+    },
+    []
+  );
+
+  const analyzeActiveWithRetry = useCallback(
+    async (
+      seller: string,
+      force: boolean,
+      fetchPrices: boolean,
+      onRetry?: (attempt: number) => void
+    ) => {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt <= NETWORK_RETRY_MAX; attempt++) {
+        try {
+          return await analyzeActiveSeller(
+            seller,
+            storeIdRef.current,
+            force,
+            fetchPrices
+          );
+        } catch (err) {
+          lastErr = err;
+          if (!isRetryableAnalyzeError(err) || attempt === NETWORK_RETRY_MAX) {
+            throw err;
+          }
+          onRetry?.(attempt + 1);
+          await new Promise((r) =>
+            setTimeout(r, NETWORK_RETRY_DELAY_MS * (attempt + 1))
+          );
+        }
+      }
+      throw lastErr;
+    },
+    []
+  );
+
+  const runOne = useCallback(
+    async (item: QueueItem) => {
+      try {
+        const force = Boolean(item.forceRefresh);
+        const fetchPrices = item.fetchPrices !== false;
+        const isActiveScan = item.scanMode === "active";
+
+        if (isActiveScan) {
+          setScanningActiveSeller(item.seller);
+        }
+
+        let data = isActiveScan
+          ? await analyzeActiveWithRetry(
+              item.sellerInput ?? item.seller,
+              force,
+              fetchPrices,
+              (attempt) => {
+                toast.message(
+                  `${item.seller}: live scan connection error — retry ${attempt}/${NETWORK_RETRY_MAX}…`
+                );
+              }
+            )
+          : await analyzeSellerWithRetry(
+              item.sellerInput ?? item.seller,
+              item.daysBack,
+              force,
+              fetchPrices,
+              (attempt) => {
+                toast.message(
+                  `${item.seller}: connection error — retry ${attempt}/${NETWORK_RETRY_MAX}…`
+                );
+              }
+            );
+
+        if (!isActiveScan) {
+          for (let retry = 0; retry < EMPTY_RETRY_MAX && data.summary.total_listings === 0; retry++) {
+            await new Promise((r) => setTimeout(r, EMPTY_RETRY_DELAY_MS));
+            data = await analyzeSellerWithRetry(
+              item.sellerInput ?? item.seller,
+              item.daysBack,
+              force,
+              fetchPrices,
+              (attempt) => {
+                toast.message(
+                  `${item.seller}: retry empty result (${attempt}/${NETWORK_RETRY_MAX})…`
+                );
+              }
+            );
+          }
+        }
+
+        const withPrices = enrichListingsProfit(
+          data.listings,
+          storeSettingsRef.current
+        );
+        const accepted = filterAcceptedMatches(withPrices);
+        const matchedReported = Math.max(
+          accepted.length,
+          Number(data.summary.matched_to_amazon ?? 0)
+        );
+        const pricesLoaded = countAcceptedPricesLoaded(
+          accepted.length > 0
+            ? accepted
+            : withPrices.filter((l) => l.amazon_asin && isAcceptedMatch(l))
+        );
+        const extraProxy = {};
+        const proxyTotals = addProxyTotals(
+          {
+            proxy_bytes: data.summary.proxy_bytes,
+            proxy_cost_usd: data.summary.proxy_cost_usd,
+            proxy_requests: data.summary.proxy_requests,
+            proxy_stages: data.summary.proxy_stages,
+          },
+          extraProxy
+        );
+
+        if (isActiveScan) {
+          bumpActive();
+          item.status = "done";
+          item.matched = matchedReported;
+          item.total = data.summary.total_listings;
+          item.pricesLoaded = pricesLoaded;
+          item.pricesTotal = matchedReported;
+          item.cached = data.cached;
+          item.costUsd = proxyTotals.costUsd;
+          item.costBytes = proxyTotals.costBytes;
+          item.costRequests = proxyTotals.costRequests;
+          item.costStages = proxyTotals.costStages;
+          item.ebaySellerId = data.summary.ebay_seller_id as string | undefined;
+          item.ebayStoreResolved = Boolean(data.summary.ebay_store_resolved);
+          toast.success(
+            `${item.seller}: ${matchedReported} live matches · ${data.summary.total_listings} active scraped`
+          );
+          return;
+        }
+
+        let syncImported = 0;
+        let visibleAfter = 0;
+        try {
+          const imp = await importFoundFromAnalysis(item.seller, item.daysBack);
+          syncImported = imp.imported;
+          visibleAfter = imp.total;
+          setFoundTotal((prev) => (prev === imp.total ? prev : imp.total));
+          bumpFound();
+        } catch {
+          syncImported = 0;
+        }
+
+        item.status = "done";
+        item.matched = matchedReported;
+        item.foundAdded = syncImported;
+        item.total = data.summary.total_listings;
+        item.pricesLoaded = pricesLoaded;
+        item.pricesTotal = matchedReported;
+        item.cached = Boolean(data.cached);
+        item.costUsd = proxyTotals.costUsd;
+        item.costBytes = proxyTotals.costBytes;
+        item.costRequests = proxyTotals.costRequests;
+        item.costStages = proxyTotals.costStages;
+        item.matchSkipped = data.summary.match_groups_skipped;
+        item.matchAttempted = data.summary.match_groups_attempted;
+        item.serpLookups = data.summary.serp_lookups;
+        item.serpProxy = data.summary.serp_proxy_requests;
+        item.serpDirect = data.summary.serp_direct_requests;
+        item.captchaAborted = data.summary.match_captcha_aborted;
+        item.ebayStatus = data.summary.ebay_status;
+        item.ebayMessage = data.summary.ebay_message;
+        item.ebaySellerId = data.summary.ebay_seller_id;
+        item.ebayStoreResolved = data.summary.ebay_store_resolved;
+        const persistWarn = (data.summary as { persist_warning?: string }).persist_warning;
+        if (persistWarn) {
+          toast.warning(`${item.seller}: saved to Found but DB cache failed — ${persistWarn}`);
+        }
+        if (data.summary.total_listings === 0) {
+          const hint =
+            data.summary.ebay_message ??
+            "No eBay sold listings in this window — try 30/90 days or verify the username.";
+          toast.warning(`${item.seller}: ${hint}`);
+        } else if (visibleAfter > 0 || syncImported > 0) {
+          const priceNote =
+            pricesLoaded < matchedReported
+              ? ` · ${pricesLoaded}/${matchedReported} prices`
+              : matchedReported > 0
+                ? ` · ${pricesLoaded} prices`
+                : "";
+          const proxyNote =
+            proxyTotals.costBytes > 0
+              ? ` · ${formatBytes(proxyTotals.costBytes)} · $${proxyTotals.costUsd < 0.01 ? proxyTotals.costUsd.toFixed(4) : proxyTotals.costUsd.toFixed(2)} proxy`
+              : item.cached
+                ? " · cached (no proxy)"
+                : "";
+          toast.success(
+            `${item.seller}: ${visibleAfter} in Found (${syncImported} from scan)${priceNote}${proxyNote}`
+          );
+        } else if (matchedReported > 0) {
+          toast.warning(
+            `${item.seller}: ${matchedReported} matches on server — open Found tab and tap Import, or refresh the page.`
+          );
+        } else {
+          const skipped = data.summary.match_groups_skipped ?? 0;
+          const captcha = data.summary.match_captcha_aborted;
+          const mb =
+            proxyTotals.costBytes > 0
+              ? `${(proxyTotals.costBytes / (1024 * 1024)).toFixed(1)} MB proxy`
+              : "";
+          toast.warning(
+            `${item.seller}: 0 Amazon matches from ${data.summary.total_listings} eBay sold` +
+              (skipped > 0
+                ? ` — searched ${data.summary.match_groups_attempted ?? "?"} newest unique titles, skipped ${skipped}`
+                : "") +
+              (captcha ? " — Amazon captcha/block" : "") +
+              (mb ? ` · ${mb} proxy` : "") +
+              ". Try 7-day window."
+          );
+        }
+      } catch (err) {
+        item.status = "failed";
+        const raw = err instanceof Error ? err.message : "Analysis failed";
+        item.error = /api connection failed|failed to fetch|networkerror|load failed/i.test(raw)
+          ? "Connection lost — Retry (keep tab open on http://127.0.0.1:3000, Ctrl+F5 first)"
+          : /request failed \(500\)|scan proxy error/i.test(raw)
+            ? "Scan timed out in UI proxy — retry; use Fresh scan off if seller was scanned before"
+          : /scraper failed/i.test(raw)
+            ? raw.replace(/^Scraper failed:?\s*/i, "Scraper: ")
+            : raw.length > 120
+              ? `${raw.slice(0, 120)}…`
+              : raw;
+        toast.error(`${item.seller}: ${item.error}`);
+      } finally {
+        setScanningActiveSeller(null);
+        archiveAndRemoveQueueItem(item);
+        activeRef.current -= 1;
+        syncQueue();
+        setPastSellersRefresh((n) => n + 1);
+        setTimeout(() => pumpRef.current(), SELLER_COOLDOWN_MS);
+      }
+    },
+    [syncQueue, analyzeSellerWithRetry, analyzeActiveWithRetry, archiveAndRemoveQueueItem, bumpFound, bumpActive]
+  );
+
+  const pump = useCallback(() => {
+    if (queuePausedRef.current) return;
+    while (activeRef.current < MAX_PARALLEL_SELLERS) {
+      const next = queueRef.current.find((it) => it.status === "queued");
+      if (!next) break;
+      next.status = "running";
+      activeRef.current += 1;
+      syncQueue();
+      void runOne(next);
     }
-    return () => {
-      for (const es of Array.from(streams.values())) es.close();
-    };
-  }, [queueView, archiveAndRemoveQueueItem, bumpActive, bumpFound, syncQueue]);
+  }, [runOne, syncQueue]);
+
+  useEffect(() => {
+    pumpRef.current = pump;
+  }, [pump]);
 
   const enqueue = useCallback(
     (
@@ -1276,7 +1467,7 @@ export default function ProductFinderPage() {
         return false;
       }
 
-      const dupActive = Array.from(queueMapRef.current.values()).find(
+      const dupActive = queueRef.current.find(
         (it) =>
           it.seller.toLowerCase() === norm.toLowerCase() &&
           it.daysBack === daysBack &&
@@ -1289,34 +1480,26 @@ export default function ProductFinderPage() {
         return false;
       }
 
-      void postPfScan({
-        seller: parsed.apiInput,
-        scanType: "sold",
+      queuePausedRef.current = false;
+
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      queueRef.current.push({
+        id,
+        seller: norm,
+        sellerInput: parsed.apiInput,
         daysBack,
-        forceRefresh,
-        fetchPrices,
-        storeSettings: (storeSettingsRef.current ?? {}) as Record<string, unknown>,
-      })
-        .then(async () => {
-          const jobs = await getPfScanJobs();
-          for (const j of jobs.jobs) {
-            queueMapRef.current.set(j.id, {
-              id: j.id,
-              seller: j.seller,
-              daysBack: j.daysBack,
-              scanMode: j.scanType as "sold" | "active",
-              status: j.status === "active" ? "running" : (j.status as QueueItem["status"]),
-              forceRefresh: j.forceRefresh || undefined,
-            });
-          }
-          syncQueue();
-        })
-        .catch((err) => {
-          toast.error(err instanceof Error ? err.message : "Queue add failed");
-        });
+        status: "queued",
+        forceRefresh: forceRefresh || undefined,
+        fetchPrices: fetchPrices ? undefined : false,
+      });
+      syncQueue();
+      pump();
       return true;
     },
-    [syncQueue]
+    [pump, syncQueue]
   );
 
   const enqueueMany = useCallback(
@@ -1384,7 +1567,7 @@ export default function ProductFinderPage() {
         toast.error(`Invalid seller: "${sellerInput.trim() || "(empty)"}"`);
         return false;
       }
-      const dup = Array.from(queueMapRef.current.values()).find(
+      const dup = queueRef.current.find(
         (it) =>
           it.seller.toLowerCase() === norm.toLowerCase() &&
           it.scanMode === "active" &&
@@ -1394,35 +1577,26 @@ export default function ProductFinderPage() {
         toast.message(`${norm} live scan is already in the queue.`);
         return false;
       }
-      void postPfScan({
-        seller: parsed.apiInput,
-        scanType: "active",
+      queuePausedRef.current = false;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      queueRef.current.push({
+        id,
+        seller: norm,
+        sellerInput: parsed.apiInput,
         daysBack: 0,
-        forceRefresh,
-        fetchPrices: true,
-        storeSettings: (storeSettingsRef.current ?? {}) as Record<string, unknown>,
-      })
-        .then(() => getPfScanJobs())
-        .then((jobs) => {
-          for (const j of jobs.jobs) {
-            queueMapRef.current.set(j.id, {
-              id: j.id,
-              seller: j.seller,
-              daysBack: j.daysBack,
-              scanMode: j.scanType as "sold" | "active",
-              status: j.status === "active" ? "running" : (j.status as QueueItem["status"]),
-              forceRefresh: j.forceRefresh || undefined,
-            });
-          }
-          syncQueue();
-        })
-        .catch((err) => {
-          toast.error(err instanceof Error ? err.message : "Live queue add failed");
-        });
+        scanMode: "active",
+        status: "queued",
+        forceRefresh: forceRefresh || undefined,
+      });
+      syncQueue();
+      pump();
       toast.message(`Queued live scan for ${norm} — watch Queue tab for progress.`);
       return true;
     },
-    [syncQueue]
+    [pump, syncQueue]
   );
 
   const importManyToFound = useCallback(
@@ -1513,70 +1687,45 @@ export default function ProductFinderPage() {
 
   const retryQueued = useCallback(
     (id: string) => {
-      const item = queueMapRef.current.get(id);
+      const item = queueRef.current.find((it) => it.id === id);
       if (!item || item.status !== "failed") return;
-      void postPfScan({
-        seller: item.sellerInput ?? item.seller,
-        scanType: item.scanMode === "active" ? "active" : "sold",
-        daysBack: item.daysBack,
-        forceRefresh: Boolean(item.forceRefresh),
-        fetchPrices: item.fetchPrices !== false,
-      }).then(() => getPfScanJobs()).then((jobs) => {
-        for (const j of jobs.jobs) {
-          queueMapRef.current.set(j.id, {
-            id: j.id,
-            seller: j.seller,
-            daysBack: j.daysBack,
-            scanMode: j.scanType as "sold" | "active",
-            status: j.status === "active" ? "running" : (j.status as QueueItem["status"]),
-            forceRefresh: j.forceRefresh || undefined,
-          });
-        }
-        syncQueue();
-      }).catch(() => undefined);
+      item.status = "queued";
+      item.error = undefined;
+      syncQueue();
+      pump();
     },
-    [syncQueue]
+    [pump, syncQueue]
   );
 
   const retryAllFailed = useCallback(() => {
     let n = 0;
-    for (const it of Array.from(queueMapRef.current.values())) {
+    for (const it of queueRef.current) {
       if (it.status === "failed") {
+        it.status = "queued";
+        it.error = undefined;
         n += 1;
-        void postPfScan({
-          seller: it.sellerInput ?? it.seller,
-          scanType: it.scanMode === "active" ? "active" : "sold",
-          daysBack: it.daysBack,
-          forceRefresh: Boolean(it.forceRefresh),
-          fetchPrices: it.fetchPrices !== false,
-        }).catch(() => undefined);
       }
     }
     if (n === 0) return;
+    syncQueue();
+    pump();
     toast.message(`Re-queued ${n} failed seller(s).`);
-  }, []);
+  }, [pump, syncQueue]);
 
   const removeQueued = (id: string) => {
-    void cancelPfScan(id)
-      .then(() => {
-        queueMapRef.current.delete(id);
-        syncQueue();
-      })
-      .catch(() => undefined);
+    queueRef.current = queueRef.current.filter((it) => it.id !== id);
+    syncQueue();
   };
 
   const stopAllQueued = useCallback(() => {
-    const items = Array.from(queueMapRef.current.values());
-    const waiting = items.filter((it) => it.status === "queued").length;
-    const running = items.filter((it) => it.status === "running").length;
+    const waiting = queueRef.current.filter((it) => it.status === "queued").length;
+    const running = queueRef.current.filter((it) => it.status === "running").length;
     if (waiting === 0 && running === 0) {
       toast.message("Queue is empty.");
       return;
     }
-    for (const it of items.filter((x) => x.status === "queued")) {
-      void cancelPfScan(it.id).catch(() => undefined);
-      queueMapRef.current.delete(it.id);
-    }
+    queueRef.current = queueRef.current.filter((it) => it.status !== "queued");
+    queuePausedRef.current = true;
     syncQueue();
     if (waiting > 0) {
       toast.success(
@@ -1590,7 +1739,7 @@ export default function ProductFinderPage() {
   }, [syncQueue]);
 
   const clearFinished = () => {
-    for (const it of Array.from(queueMapRef.current.values())) {
+    for (const it of queueRef.current) {
       if (it.status === "done" || it.status === "failed") {
         archiveAndRemoveQueueItem(it);
       }
@@ -1623,7 +1772,9 @@ export default function ProductFinderPage() {
     return keys;
   }, [queueView]);
 
-  const queuedCount = queueView.filter((i) => i.status === "queued" || i.status === "running").length;
+  const queuedCount = queueView.filter(
+    (i) => i.status === "queued" || i.status === "running"
+  ).length;
   const tabs = [
     { id: "queue" as const, title: "Queue", count: queuedCount },
     { id: "sellers" as const, title: "Sellers", count: watchlistCount },

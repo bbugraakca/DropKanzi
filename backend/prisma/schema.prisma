@@ -49,7 +49,6 @@ model PriceHistory {
 
 model SellerAnalysis {
   id        String   @id @default(cuid())
-  tenantId  String   @default("default")
   seller    String
   daysBack  Int
   scanType  String   @default("sold")
@@ -57,21 +56,18 @@ model SellerAnalysis {
   summary   Json
   createdAt DateTime @default(now())
 
-  @@index([tenantId, createdAt(sort: Desc)])
   @@index([seller, scanType, createdAt(sort: Desc)])
 }
 
 /// Merged matched listings across all scans (7d + 30d + multiple sellers).
 model FoundProduct {
   listingKey String   @id
-  tenantId   String   @default("default")
   seller     String?
   daysBack   Int?
   payload    Json
   updatedAt  DateTime @updatedAt
   createdAt  DateTime @default(now())
 
-  @@index([tenantId, updatedAt(sort: Desc)])
   @@index([seller])
   @@index([updatedAt(sort: Desc)])
 }
@@ -79,83 +75,36 @@ model FoundProduct {
 /// Product Finder Saved / Reserved lists (persisted server-side).
 model PfLibraryProduct {
   listingKey String   @id
-  tenantId   String   @default("default")
   bucket     String
   payload    Json
   updatedAt  DateTime @updatedAt
   createdAt  DateTime @default(now())
 
-  @@index([tenantId, bucket, updatedAt(sort: Desc)])
   @@index([bucket, updatedAt(sort: Desc)])
 }
 
 /// Snapshot before destructive clears — one-click recovery.
 model PfDataArchive {
   id         String   @id @default(cuid())
-  tenantId   String   @default("default")
   source     String
   listingKey String
   payload    Json
   reason     String
   createdAt  DateTime @default(now())
 
-  @@index([tenantId, source, createdAt(sort: Desc)])
   @@index([source, createdAt(sort: Desc)])
 }
 
 /// eBay seller live/active listings matched to Amazon.
 model ActiveListingProduct {
   listingKey String   @id
-  tenantId   String   @default("default")
   seller     String?
   payload    Json
   updatedAt  DateTime @updatedAt
   createdAt  DateTime @default(now())
 
-  @@index([tenantId, updatedAt(sort: Desc)])
   @@index([seller])
   @@index([updatedAt(sort: Desc)])
-}
-
-model Tenant {
-  id        String   @id @default(cuid())
-  name      String
-  settings  Json?
-  createdAt DateTime @default(now())
-
-  @@index([createdAt(sort: Desc)])
-}
-
-model PfScanJob {
-  id           String   @id
-  tenantId     String   @default("default")
-  seller       String
-  scanType     String
-  daysBack     Int
-  forceRefresh Boolean  @default(false)
-  status       String   @default("queued")
-  stage        String?
-  progress     Json?
-  error        String?
-  result       Json?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  @@index([tenantId, status, createdAt])
-}
-
-model MatchFeedback {
-  id            String   @id @default(cuid())
-  tenantId      String   @default("default")
-  titleHash     String
-  suggestedAsin String
-  action        String
-  correctedAsin String?
-  userId        String?
-  createdAt     DateTime @default(now())
-
-  @@index([tenantId, createdAt(sort: Desc)])
-  @@index([titleHash, suggestedAsin])
 }
 
 model ScrapeJob {

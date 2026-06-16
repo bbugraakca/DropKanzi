@@ -31,8 +31,6 @@ import proxy_meter
 import match_cache
 from amazon_search import reset_captcha_streak, reset_serp_meter, summarize_serp_meter
 from image_match import warmup as siglip_warmup
-from progress import publish_progress, is_cancelled
-from semantic import embed_texts
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,11 +38,6 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await siglip_warmup()
-    try:
-        # Warm semantic model once at startup to avoid first-request latency spike.
-        embed_texts(["warmup"])
-    except Exception:
-        pass
     yield
 
 
@@ -97,7 +90,6 @@ class ProductFinderRequest(BaseModel):
     store_settings: dict = Field(default_factory=dict)
     fetch_prices: bool = FINDER_FETCH_PRICES_ON_ANALYZE
     force_refresh: bool = False
-    job_id: str | None = None
 
 
 class ProductFinderActiveRequest(BaseModel):
@@ -106,7 +98,6 @@ class ProductFinderActiveRequest(BaseModel):
     fetch_prices: bool = FINDER_FETCH_PRICES_ON_ANALYZE
     force_refresh: bool = False
     max_items: int = 0  # 0 → ACTIVE_MAX_LISTINGS
-    job_id: str | None = None
 
 
 class ProductFinderPricesRequest(BaseModel):
@@ -272,7 +263,6 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
 
     # Start a fresh proxy-cost meter for this analysis.
     proxy_meter.start()
-    publish_progress(req.job_id, {"jobId": req.job_id, "status": "active", "stage": "ebay_scrape"})
     reset_serp_meter()
     reset_captcha_streak()
     if req.force_refresh:
@@ -295,8 +285,6 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
     store_name = resolution.get("store_name") or store_name_hint
     listings: list[dict] = []
     for attempt in range(5):
-        if is_cancelled(req.job_id):
-            raise HTTPException(status_code=499, detail="Scan canceled")
         listings = await scrape_seller_sold_listings(
             seller,
             days_back=req.days_back,
@@ -334,15 +322,6 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
         }
 
     truncated = len(listings) >= MAX_FINDER_LISTINGS
-    publish_progress(
-        req.job_id,
-        {
-            "jobId": req.job_id,
-            "status": "active",
-            "stage": "matching",
-            "total_listings": len(listings),
-        },
-    )
 
     # 2) Match via Amazon search (SERP capped at ~96 KB each; Redis title cache).
     for i, l in enumerate(listings):
@@ -351,8 +330,6 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
     unmatched = [l for l in listings if not l.get("amazon_asin")]
     match_stats = {"groups_total": 0, "groups_attempted": 0, "groups_skipped": 0, "captcha_aborted": False}
     if unmatched:
-        if is_cancelled(req.job_id):
-            raise HTTPException(status_code=499, detail="Scan canceled")
         matched_extra, match_stats = await match_listings_batch(
             unmatched,
             concurrency=MATCH_CONCURRENCY,
@@ -399,15 +376,6 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
         1 for l in matched_for_price if l.get("amazon_price") is not None
     )
     if req.fetch_prices:
-        publish_progress(
-            req.job_id,
-            {
-                "jobId": req.job_id,
-                "status": "active",
-                "stage": "pricing",
-                "matched_to_amazon": len(matched_for_price),
-            },
-        )
         proxy_meter.stage("amazon_price")
         for listing in matched_for_price:
             if listing.get("amazon_asin"):
@@ -521,19 +489,9 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
         **summarize_serp_meter(),
         **proxy_meter.summarize(),
     }
-    publish_progress(
-        req.job_id,
-        {
-            "jobId": req.job_id,
-            "status": "active",
-            "stage": "merging",
-            "summary": summary,
-        },
-    )
 
-    # Slim all rows for persistence/history (~300B each vs multi-KB raw dicts).
-    slim = [_slim_finder_listing(l) for l in listings]
-    return {"seller": seller, "listings": slim, "summary": summary}
+    # Only return accepted matches — sending 5000+ raw eBay rows blows up JSON (~200MB) and causes HTTP 500.
+    return {"seller": seller, "listings": matched, "summary": summary}
 
 
 async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
@@ -548,7 +506,6 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
     max_items = min(ACTIVE_MAX_LISTINGS, max(1, int(req.max_items or ACTIVE_MAX_LISTINGS)))
 
     proxy_meter.start()
-    publish_progress(req.job_id, {"jobId": req.job_id, "status": "active", "stage": "ebay_scrape"})
     reset_serp_meter()
     reset_captcha_streak()
     if req.force_refresh:
@@ -566,8 +523,6 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
     store_name = resolution.get("store_name") or store_name_hint
     listings: list[dict] = []
     for attempt in range(5):
-        if is_cancelled(req.job_id):
-            raise HTTPException(status_code=499, detail="Scan canceled")
         listings = await scrape_seller_active_listings(
             seller,
             max_items=max_items,
@@ -619,15 +574,6 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
         }
 
     truncated = len(listings) >= max_items
-    publish_progress(
-        req.job_id,
-        {
-            "jobId": req.job_id,
-            "status": "active",
-            "stage": "matching",
-            "total_listings": len(listings),
-        },
-    )
 
     for i, l in enumerate(listings):
         l["_idx"] = i
@@ -636,8 +582,6 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
     unmatched = [l for l in listings if not l.get("amazon_asin")]
     match_stats = {"groups_total": 0, "groups_attempted": 0, "groups_skipped": 0, "captcha_aborted": False}
     if unmatched:
-        if is_cancelled(req.job_id):
-            raise HTTPException(status_code=499, detail="Scan canceled")
         matched_extra, match_stats = await match_listings_batch(
             unmatched,
             concurrency=MATCH_CONCURRENCY,
@@ -682,15 +626,6 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
         1 for l in matched_for_price if l.get("amazon_price") is not None
     )
     if req.fetch_prices:
-        publish_progress(
-            req.job_id,
-            {
-                "jobId": req.job_id,
-                "status": "active",
-                "stage": "pricing",
-                "matched_to_amazon": len(matched_for_price),
-            },
-        )
         proxy_meter.stage("amazon_price")
         for listing in matched_for_price:
             if listing.get("amazon_asin"):
@@ -768,57 +703,7 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
         **summarize_serp_meter(),
         **proxy_meter.summarize(),
     }
-    publish_progress(
-        req.job_id,
-        {
-            "jobId": req.job_id,
-            "status": "active",
-            "stage": "merging",
-            "summary": summary,
-        },
-    )
-    slim = [_slim_finder_listing(l) for l in listings]
-    return {"seller": seller, "listings": slim, "summary": summary}
-
-
-def _slim_finder_listing(l: dict) -> dict:
-    keys = (
-        "listing_id",
-        "title",
-        "sold_price",
-        "quantity_sold",
-        "sold_date",
-        "url",
-        "image",
-        "amazon_asin",
-        "amazon_price",
-        "match_confidence",
-        "net_profit",
-        "margin_percent",
-        "is_profitable",
-        "amazon_url",
-        "amazon_stock",
-        "match_method",
-        "match_title_score",
-        "match_image_score",
-        "roi_percent",
-        "revenue",
-        "ebay_fee",
-        "payment_fee",
-        "amazon_cost",
-    )
-    out = {k: l[k] for k in keys if k in l and l[k] is not None}
-    if "title" not in out:
-        out["title"] = str(l.get("title") or "")
-    if "url" not in out:
-        out["url"] = str(l.get("url") or "")
-    if "image" not in out:
-        out["image"] = str(l.get("image") or "")
-    if "quantity_sold" not in out:
-        out["quantity_sold"] = int(l.get("quantity_sold") or 1)
-    if "is_profitable" not in out:
-        out["is_profitable"] = bool(l.get("is_profitable"))
-    return out
+    return {"seller": seller, "listings": matched, "summary": summary}
 
 
 def _empty_summary() -> dict:

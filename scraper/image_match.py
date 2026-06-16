@@ -18,7 +18,6 @@ import requests as req_sync
 import torch
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
-from proxy_http import ensure_proxy
 
 logger = logging.getLogger("pricehawk.image_match")
 
@@ -61,7 +60,7 @@ def _load_model_sync():
 
 
 def _download_image_sync(url: str, timeout: int = 8) -> Optional[Image.Image]:
-    """Download image synchronously via datacenter proxy."""
+    """Download image synchronously. No proxy — CDN images are public."""
     if not url or not url.startswith("http"):
         return None
     try:
@@ -69,13 +68,7 @@ def _download_image_sync(url: str, timeout: int = 8) -> Optional[Image.Image]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "image/webp,image/avif,image/*,*/*;q=0.8",
         }
-        r = req_sync.get(
-            url,
-            headers=headers,
-            timeout=timeout,
-            stream=True,
-            proxies=ensure_proxy("datacenter"),
-        )
+        r = req_sync.get(url, headers=headers, timeout=timeout, stream=True)
         if r.status_code != 200:
             return None
         content_type = r.headers.get("content-type", "")

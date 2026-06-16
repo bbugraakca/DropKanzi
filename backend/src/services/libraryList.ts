@@ -1,5 +1,5 @@
 import { Prisma } from "@prisma/client";
-import { prisma, currentTenantId } from "./db";
+import { prisma } from "./db";
 import {
   allRemoveKeys,
   listingKey,
@@ -28,9 +28,8 @@ function slimListings(listings: FinderListing[]): FinderListing[] {
 }
 
 export async function listLibrary(bucket: LibraryBucket): Promise<FinderListing[]> {
-  const tenantId = currentTenantId();
   const rows = await prisma.pfLibraryProduct.findMany({
-    where: { tenantId, bucket },
+    where: { bucket },
     orderBy: { updatedAt: "desc" },
     take: 5000,
   });
@@ -43,9 +42,8 @@ export async function syncLibrary(
   listings: FinderListing[],
   opts?: { force?: boolean }
 ): Promise<{ count: number }> {
-  const tenantId = currentTenantId();
   const slim = slimListings(listings);
-  const existingCount = await prisma.pfLibraryProduct.count({ where: { tenantId, bucket } });
+  const existingCount = await prisma.pfLibraryProduct.count({ where: { bucket } });
 
   if (slim.length === 0 && existingCount > 0 && !opts?.force) {
     throw new Error(
@@ -61,12 +59,11 @@ export async function syncLibrary(
   const entries = Array.from(map.entries());
 
   await prisma.$transaction(async (tx) => {
-    await tx.pfLibraryProduct.deleteMany({ where: { tenantId, bucket } });
+    await tx.pfLibraryProduct.deleteMany({ where: { bucket } });
     if (entries.length === 0) return;
     await tx.pfLibraryProduct.createMany({
       data: entries.map(([key, payload]) => ({
         listingKey: key,
-        tenantId,
         bucket,
         payload: payload as Prisma.InputJsonValue,
       })),
@@ -81,20 +78,16 @@ export async function mergeLibrary(
   bucket: LibraryBucket,
   listings: FinderListing[]
 ): Promise<{ merged: number }> {
-  const tenantId = currentTenantId();
   const slim = slimListings(listings);
   let merged = 0;
   for (const raw of slim) {
     const key = listingKey(raw);
-    const existing = await prisma.pfLibraryProduct.findFirst({
-      where: { tenantId, listingKey: key },
-    });
+    const existing = await prisma.pfLibraryProduct.findUnique({ where: { listingKey: key } });
     const payload = mergeListing(existing?.payload as FinderListing | undefined, raw);
     await prisma.pfLibraryProduct.upsert({
       where: { listingKey: key },
       create: {
         listingKey: key,
-        tenantId,
         bucket,
         payload: payload as Prisma.InputJsonValue,
       },
@@ -113,7 +106,6 @@ export async function removeLibraryKeys(
   keys: string[],
   listings: FinderListing[] = []
 ): Promise<{ removed: number }> {
-  const tenantId = currentTenantId();
   const keySet = new Set(keys.map((k) => k.trim()).filter(Boolean));
   for (const item of listings) {
     for (const k of allRemoveKeys(item)) keySet.add(k);
@@ -124,7 +116,6 @@ export async function removeLibraryKeys(
   const { count } = await prisma.pfLibraryProduct.deleteMany({
     where: {
       bucket,
-      tenantId,
       listingKey: { in: toDelete },
     },
   });
@@ -132,9 +123,8 @@ export async function removeLibraryKeys(
 }
 
 export async function clearLibrary(bucket: LibraryBucket): Promise<{ cleared: number; archived: number }> {
-  const tenantId = currentTenantId();
   const archived = await archiveLibraryBeforeClear(bucket);
-  const { count } = await prisma.pfLibraryProduct.deleteMany({ where: { tenantId, bucket } });
+  const { count } = await prisma.pfLibraryProduct.deleteMany({ where: { bucket } });
   return { cleared: count, archived };
 }
 
@@ -143,7 +133,6 @@ export async function restoreLibraryToFound(
   bucket: LibraryBucket,
   listings: FinderListing[]
 ): Promise<{ restored: number }> {
-  const tenantId = currentTenantId();
   const slim = slimListings(listings);
   if (slim.length === 0) return { restored: 0 };
 
@@ -157,8 +146,8 @@ export async function restoreLibraryToFound(
   const keys = [...payloads.keys()];
 
   const [existingLib, existingFound] = await Promise.all([
-    prisma.pfLibraryProduct.findMany({ where: { tenantId, listingKey: { in: keys } } }),
-    prisma.foundProduct.findMany({ where: { tenantId, listingKey: { in: keys } } }),
+    prisma.pfLibraryProduct.findMany({ where: { listingKey: { in: keys } } }),
+    prisma.foundProduct.findMany({ where: { listingKey: { in: keys } } }),
   ]);
   for (const row of existingLib) {
     const incoming = payloads.get(row.listingKey);
@@ -183,7 +172,6 @@ export async function restoreLibraryToFound(
     const payload = payloads.get(key) as FinderListing;
     return {
       listingKey: key,
-      tenantId,
       seller: (payload.source_seller as string | undefined) ?? null,
       daysBack: payload.source_days_back != null ? Number(payload.source_days_back) : null,
       payload: payload as unknown as Prisma.InputJsonValue,
@@ -195,9 +183,9 @@ export async function restoreLibraryToFound(
     const chunkKeys = chunk.map((r) => r.listingKey);
     await prisma.$transaction([
       prisma.pfLibraryProduct.deleteMany({
-        where: { tenantId, bucket, listingKey: { in: chunkKeys } },
+        where: { bucket, listingKey: { in: chunkKeys } },
       }),
-      prisma.foundProduct.deleteMany({ where: { tenantId, listingKey: { in: chunkKeys } } }),
+      prisma.foundProduct.deleteMany({ where: { listingKey: { in: chunkKeys } } }),
       prisma.foundProduct.createMany({ data: chunk, skipDuplicates: true }),
     ]);
   }
@@ -211,7 +199,6 @@ export async function moveLibrary(
   to: LibraryBucket,
   listings: FinderListing[]
 ): Promise<{ moved: number }> {
-  const tenantId = currentTenantId();
   const slim = slimListings(listings);
   if (slim.length === 0) return { moved: 0 };
 
@@ -225,7 +212,7 @@ export async function moveLibrary(
   const keys = [...payloads.keys()];
 
   const existing = await prisma.pfLibraryProduct.findMany({
-    where: { tenantId, listingKey: { in: keys } },
+    where: { listingKey: { in: keys } },
   });
   for (const row of existing) {
     const incoming = payloads.get(row.listingKey);
@@ -239,7 +226,6 @@ export async function moveLibrary(
 
   const rows = keys.map((key) => ({
     listingKey: key,
-    tenantId,
     bucket: to,
     payload: payloads.get(key) as unknown as Prisma.InputJsonValue,
   }));
@@ -248,7 +234,7 @@ export async function moveLibrary(
     const chunk = rows.slice(i, i + CHUNK);
     const chunkKeys = chunk.map((r) => r.listingKey);
     await prisma.$transaction([
-      prisma.pfLibraryProduct.deleteMany({ where: { tenantId, listingKey: { in: chunkKeys } } }),
+      prisma.pfLibraryProduct.deleteMany({ where: { listingKey: { in: chunkKeys } } }),
       prisma.pfLibraryProduct.createMany({ data: chunk, skipDuplicates: true }),
     ]);
   }
@@ -265,9 +251,8 @@ export function parseLibraryBucket(raw: unknown): LibraryBucket | null {
 export async function dedupeLibrary(
   bucket: LibraryBucket
 ): Promise<{ removed: number; total: number }> {
-  const tenantId = currentTenantId();
   const rows = await prisma.pfLibraryProduct.findMany({
-    where: { tenantId, bucket },
+    where: { bucket },
     select: { listingKey: true, payload: true },
   });
 
@@ -301,7 +286,7 @@ export async function dedupeLibrary(
   }
 
   await prisma.pfLibraryProduct.deleteMany({
-    where: { tenantId, listingKey: { in: Array.from(toDelete) } },
+    where: { listingKey: { in: Array.from(toDelete) } },
   });
   return { removed: toDelete.size, total: rows.length - toDelete.size };
 }

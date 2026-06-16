@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from curl_cffi.requests import AsyncSession
 from parsel import Selector
 
-from proxy_http import ensure_proxy
+from proxy import get_proxy_url
 import proxy_meter
 
 logger = logging.getLogger("pricehawk.ebay")
@@ -188,8 +188,9 @@ async def _ebay_get_force_proxy(session: AsyncSession, url: str, **kwargs):
 
 
 def _proxies() -> dict | None:
-    """eBay sold search — residential gateway only (dc.* often fails DNS in Docker)."""
-    return ensure_proxy("residential")
+    """Route eBay through the residential proxy to avoid datacenter-IP challenges."""
+    url = get_proxy_url()
+    return {"http": url, "https": url} if url else None
 
 
 def _html_looks_blocked(html: str) -> bool:
@@ -213,7 +214,9 @@ EBAY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
-from asin_util import normalize_asin
+# ASINs are 10 chars; modern ones are B0XXXXXXXX. Tightened to avoid matching
+# random 10-char tokens in page HTML.
+from asin_util import is_plausible_asin, normalize_asin, _ASIN_LABELED_RE
 
 _ASIN_DP_RE = re.compile(r"amazon\.[a-z.]+/(?:dp|gp/product)/([A-Z0-9]{10})", re.IGNORECASE)
 
@@ -354,12 +357,8 @@ async def _ebay_get(session: AsyncSession, url: str, **kwargs):
     try:
         if EBAY_PROXY_MODE == "always":
             r = await session.get(url, proxies=_proxies(), **kwargs)
-            if r is not None and r.status_code == 200 and not _is_challenged(r):
-                proxy_meter.add_response(r)
-                return r
-            logger.warning("eBay proxy/challenge on %s — retrying direct", url[:96])
-            direct = await session.get(url, proxies=None, **kwargs)
-            return direct
+            proxy_meter.add_response(r)
+            return r
         if EBAY_PROXY_MODE == "never":
             return await session.get(url, proxies=None, **kwargs)
         r = await session.get(url, proxies=None, **kwargs)
@@ -369,11 +368,6 @@ async def _ebay_get(session: AsyncSession, url: str, **kwargs):
         return r2 if r2 is not None else r
     except Exception as exc:  # noqa: BLE001
         logger.warning("eBay GET failed %s: %s", url[:96], exc)
-        if EBAY_PROXY_MODE == "always":
-            try:
-                return await session.get(url, proxies=None, **kwargs)
-            except Exception as direct_exc:  # noqa: BLE001
-                logger.warning("eBay direct fallback failed %s: %s", url[:96], direct_exc)
         return None
 
 
@@ -681,22 +675,7 @@ async def _scrape_seller_sold_listings_inner(
     store_name: str | None = None,
 ) -> list[dict]:
     """Inner scrape loop (must run under _EBAY_GATE)."""
-
-    def _sold_line_key(it: dict) -> str:
-        sold = (
-            f"{str(it.get('sold_date') or '')[:10]}|"
-            f"{it.get('sold_price')}|{it.get('quantity_sold') or 1}"
-        )
-        lid = it.get("listing_id")
-        if lid:
-            return f"lid:{lid}|{sold}"
-        url = str(it.get("url") or "").split("?")[0]
-        if url:
-            return f"url:{url}|{sold}"
-        return f"title:{it.get('title')}|{sold}"
-
     all_items: list[dict] = []
-    seen_keys: set[str] = set()
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
     empty_window_pages = 0
 
@@ -736,18 +715,7 @@ async def _scrape_seller_sold_listings_inner(
                 if it["sold_date"] is None
                 or datetime.fromisoformat(it["sold_date"]) >= cutoff_date
             ]
-            new_items: list[dict] = []
-            for it in in_window:
-                key = _sold_line_key(it)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                new_items.append(it)
-            all_items.extend(new_items)
-
-            # Pagination stuck (challenge/cookie) — same rows repeat every page.
-            if page > 1 and len(new_items) == 0:
-                break
+            all_items.extend(in_window)
 
             if len(all_items) >= max_items:
                 break
@@ -841,17 +809,15 @@ def parse_ebay_date(date_str: str) -> Optional[datetime]:
     return None
 
 
-def _extract_asin_from_html(html: str) -> dict | None:
-    """
-    Extract ASIN from eBay listing HTML.
-
-    Only trusts explicit amazon.com/dp/ or /gp/product/ links — eBay page chrome
-    often contains labeled 10-char tokens (e.g. JLZNJLC2HE) that are not ASINs.
-    """
+def _extract_asin_from_html(html: str) -> Optional[str]:
     for m in _ASIN_DP_RE.finditer(html):
         asin = normalize_asin(m.group(1))
         if asin:
-            return {"asin": asin, "source": "dp_link"}
+            return asin
+    for m in _ASIN_LABELED_RE.finditer(html):
+        asin = normalize_asin(m.group(1))
+        if asin:
+            return asin
     return None
 
 
@@ -867,7 +833,7 @@ async def get_listing_details(
             r = await _ebay_get(sess, url, headers=headers, timeout=8)
             if r.status_code != 200:
                 return {}
-            return _extract_asin_from_html(r.text) or {}
+            return {"asin": _extract_asin_from_html(r.text)}
         except Exception:  # noqa: BLE001
             return {}
 

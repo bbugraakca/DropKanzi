@@ -1,11 +1,8 @@
-import { prisma, currentTenantId } from "./db";
-import { parseNumericFilter, parseSortColumn } from "./sqlFilter";
-import { sqlTenantWhere } from "./sqlUtils";
+import { prisma } from "./db";
 import { mergeListing, activeListingKey, type FinderListing } from "./foundProducts";
 import { Prisma } from "@prisma/client";
 import {
   enrichListingProfit,
-  ACCEPTED_MATCH_SQL,
   HAS_PRICE_SQL,
   minMarginWhereSql,
   minMatchConfidenceWhereSql,
@@ -45,16 +42,16 @@ function profitParams(query: ActivePageQuery): ProfitQueryParams {
 }
 
 const SORT_SQL: Record<ActiveSortKey, string> = {
-  profit: `NULLIF(payload->>'net_profit', '')::double precision DESC NULLS LAST`,
-  margin: `NULLIF(payload->>'margin_percent', '')::double precision DESC NULLS LAST`,
-  sold_price: `NULLIF(payload->>'sold_price', '')::double precision DESC NULLS LAST`,
-  match: `NULLIF(payload->>'match_confidence', '')::double precision DESC NULLS LAST`,
+  profit: `(payload->>'net_profit')::double precision DESC NULLS LAST`,
+  margin: `(payload->>'margin_percent')::double precision DESC NULLS LAST`,
+  sold_price: `(payload->>'sold_price')::double precision DESC NULLS LAST`,
+  match: `(payload->>'match_confidence')::double precision DESC NULLS LAST`,
 };
 
-function buildWhere(query: ActivePageQuery, paramStart = 1): { sql: string; params: unknown[] } {
+function buildWhere(query: ActivePageQuery): { sql: string; params: unknown[] } {
   const parts: string[] = ["1=1"];
   const params: unknown[] = [];
-  let i = paramStart;
+  let i = 1;
 
   if (query.seller?.trim()) {
     const seller = query.seller.trim();
@@ -85,30 +82,22 @@ function buildWhere(query: ActivePageQuery, paramStart = 1): { sql: string; para
     parts.push(MISSING_PRICE_SQL);
   }
   if (query.minMatchConfidence != null && query.minMatchConfidence > 0) {
-    const conf = parseNumericFilter(query.minMatchConfidence, { min: 0, exclusiveMin: true });
-    if (conf !== undefined) {
-      const match = minMatchConfidenceWhereSql(conf, i);
-      parts.push(match.sql);
-      params.push(...match.params);
-      i += match.params.length;
-    }
+    const match = minMatchConfidenceWhereSql(query.minMatchConfidence, i);
+    parts.push(match.sql);
+    params.push(...match.params);
+    i += match.params.length;
   }
   if (query.minMargin != null && query.minMargin > 0) {
-    const marginVal = parseNumericFilter(query.minMargin, { min: 0, exclusiveMin: true });
-    if (marginVal !== undefined) {
-      const margin = minMarginWhereSql(marginVal, profitParams(query), i);
-      parts.push(margin.sql);
-      params.push(...margin.params);
-      i += margin.params.length;
-    }
+    const margin = minMarginWhereSql(query.minMargin, profitParams(query), i);
+    parts.push(margin.sql);
+    params.push(...margin.params);
+    i += margin.params.length;
   }
-  const minList = parseNumericFilter(query.minListPrice, { min: 0, exclusiveMin: true });
-  if (minList !== undefined) {
+  if (query.minListPrice != null && query.minListPrice > 0) {
     parts.push(
-      `(NULLIF(payload->>'sold_price', '')::double precision) >= $${i}::double precision`
+      `(NULLIF(payload->>'sold_price', '')::double precision) >= $${i++}`
     );
-    params.push(minList);
-    i++;
+    params.push(query.minListPrice);
   }
 
   return { sql: parts.join(" AND "), params };
@@ -123,18 +112,12 @@ export async function listActivePage(query: ActivePageQuery): Promise<{
   const page = Math.max(1, query.page ?? 1);
   const limit = Math.min(1000, Math.max(1, query.limit ?? 50));
   const offset = (page - 1) * limit;
-  const tenantId = currentTenantId();
   const { sql: whereSql, params } = buildWhere(query);
-  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
-  const sortKey = parseSortColumn(
-    query.sort,
-    Object.keys(SORT_SQL) as ActiveSortKey[],
-    "profit"
-  );
+  const sortKey = query.sort && SORT_SQL[query.sort] ? query.sort : "profit";
   const orderSql = SORT_SQL[sortKey];
 
   const countRows = await prisma.$queryRawUnsafe<{ c: bigint }[]>(
-    `SELECT COUNT(*)::bigint AS c FROM "ActiveListingProduct" WHERE ${whereWithTenant}`,
+    `SELECT COUNT(*)::bigint AS c FROM "ActiveListingProduct" WHERE ${whereSql}`,
     ...params
   );
   const total = Number(countRows[0]?.c ?? 0);
@@ -142,7 +125,7 @@ export async function listActivePage(query: ActivePageQuery): Promise<{
   const limitIdx = params.length + 1;
   const offsetIdx = params.length + 2;
   const rows = await prisma.$queryRawUnsafe<{ payload: FinderListing; listingKey: string }[]>(
-    `SELECT payload, "listingKey" FROM "ActiveListingProduct" WHERE ${whereWithTenant} ORDER BY ${orderSql} LIMIT $${limitIdx}::int OFFSET $${offsetIdx}::int`,
+    `SELECT payload, "listingKey" FROM "ActiveListingProduct" WHERE ${whereSql} ORDER BY ${orderSql} LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     ...params,
     limit,
     offset
@@ -162,17 +145,13 @@ export async function listActivePage(query: ActivePageQuery): Promise<{
 
 export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
   total: number;
-  matched: number;
-  with_price: number;
   missing_prices: number;
   profitable: number;
   total_profit: number;
   avg_margin: number;
   total_revenue: number;
 }> {
-  const tenantId = currentTenantId();
   const { sql: whereSql, params: whereParams } = buildWhere(query);
-  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const pq = profitParams(query);
   const i = whereParams.length + 1;
   const profitable = profitableWhereSql(pq, i);
@@ -183,8 +162,6 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
   const rows = await prisma.$queryRawUnsafe<
     {
       total: bigint;
-      matched: bigint;
-      with_price: bigint;
       missing_prices: bigint;
       profitable: bigint;
       total_profit: number | null;
@@ -194,8 +171,6 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
   >(
     `SELECT
       COUNT(*)::bigint AS total,
-      COUNT(*) FILTER (WHERE ${ACCEPTED_MATCH_SQL})::bigint AS matched,
-      COUNT(*) FILTER (WHERE ${HAS_PRICE_SQL})::bigint AS with_price,
       COUNT(*) FILTER (
         WHERE payload->>'amazon_asin' IS NOT NULL
           AND (payload->>'amazon_price' IS NULL OR payload->>'amazon_price' = '')
@@ -205,15 +180,13 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
       COALESCE(AVG((${marginExpr})) FILTER (WHERE ${profitable.sql}), 0)::double precision AS avg_margin,
       COALESCE(SUM((${listPrice})), 0)::double precision AS total_revenue
     FROM "ActiveListingProduct"
-    WHERE ${whereWithTenant}`,
+    WHERE ${whereSql}`,
     ...whereParams,
     ...profitable.params
   );
   const row = rows[0];
   return {
     total: Number(row?.total ?? 0),
-    matched: Number(row?.matched ?? 0),
-    with_price: Number(row?.with_price ?? 0),
     missing_prices: Number(row?.missing_prices ?? 0),
     profitable: Number(row?.profitable ?? 0),
     total_profit: Math.round(Number(row?.total_profit ?? 0) * 100) / 100,
@@ -223,21 +196,19 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
 }
 
 export async function listActiveSellers(): Promise<string[]> {
-  const tenantId = currentTenantId();
   const rows = await prisma.$queryRaw<{ seller: string }[]>`
     SELECT DISTINCT seller FROM "ActiveListingProduct"
-    WHERE "tenantId" = ${tenantId} AND seller IS NOT NULL AND seller <> ''
+    WHERE seller IS NOT NULL AND seller <> ''
     ORDER BY seller ASC
   `;
   return rows.map((r) => r.seller);
 }
 
 export async function countActiveBySeller(): Promise<Record<string, number>> {
-  const tenantId = currentTenantId();
   const rows = await prisma.$queryRaw<{ seller: string; count: bigint }[]>`
     SELECT seller, COUNT(*)::bigint AS count
     FROM "ActiveListingProduct"
-    WHERE "tenantId" = ${tenantId} AND seller IS NOT NULL AND seller <> ''
+    WHERE seller IS NOT NULL AND seller <> ''
     GROUP BY seller
   `;
   const out: Record<string, number> = {};
@@ -250,10 +221,9 @@ export async function countActiveBySeller(): Promise<Record<string, number>> {
 export async function mergeActiveListings(
   seller: string,
   matched: FinderListing[],
-  options?: { replaceSeller?: boolean; tenantId?: string }
+  options?: { replaceSeller?: boolean }
 ): Promise<number> {
   if (matched.length === 0 && !options?.replaceSeller) return 0;
-  const tenantId = options?.tenantId || currentTenantId();
 
   // Batched merge — thousands of per-row upserts inside one interactive
   // transaction blow Prisma's 5s transaction timeout and abort everything.
@@ -274,7 +244,7 @@ export async function mergeActiveListings(
   // fetched Amazon prices etc.).
   if (keys.length > 0) {
     const existing = await prisma.activeListingProduct.findMany({
-      where: { tenantId, listingKey: { in: keys } },
+      where: { listingKey: { in: keys } },
     });
     for (const row of existing) {
       const incoming = byKey.get(row.listingKey);
@@ -288,12 +258,11 @@ export async function mergeActiveListings(
   }
 
   if (options?.replaceSeller) {
-    await prisma.activeListingProduct.deleteMany({ where: { tenantId, seller } });
+    await prisma.activeListingProduct.deleteMany({ where: { seller } });
   }
 
   const rows = keys.map((key) => ({
     listingKey: key,
-    tenantId,
     seller,
     payload: byKey.get(key) as unknown as Prisma.InputJsonValue,
   }));
@@ -302,7 +271,7 @@ export async function mergeActiveListings(
     const chunk = rows.slice(i, i + CHUNK);
     await prisma.$transaction([
       prisma.activeListingProduct.deleteMany({
-        where: { tenantId, listingKey: { in: chunk.map((r) => r.listingKey) } },
+        where: { listingKey: { in: chunk.map((r) => r.listingKey) } },
       }),
       prisma.activeListingProduct.createMany({ data: chunk, skipDuplicates: true }),
     ]);
@@ -312,38 +281,34 @@ export async function mergeActiveListings(
 }
 
 export async function clearActiveForSeller(seller: string): Promise<number> {
-  const tenantId = currentTenantId();
-  const { count } = await prisma.activeListingProduct.deleteMany({ where: { tenantId, seller } });
+  const { count } = await prisma.activeListingProduct.deleteMany({ where: { seller } });
   return count;
 }
 
 export async function removeActiveListings(keys: string[]): Promise<{ removed: number; total: number }> {
-  const tenantId = currentTenantId();
   const unique = Array.from(new Set(keys.map((k) => k.trim()).filter(Boolean)));
   if (unique.length === 0) {
-    return { removed: 0, total: await prisma.activeListingProduct.count({ where: { tenantId } }) };
+    return { removed: 0, total: await prisma.activeListingProduct.count() };
   }
   const CHUNK = 500;
   let removed = 0;
   for (let i = 0; i < unique.length; i += CHUNK) {
     const chunk = unique.slice(i, i + CHUNK);
     const { count } = await prisma.activeListingProduct.deleteMany({
-      where: { tenantId, listingKey: { in: chunk } },
+      where: { listingKey: { in: chunk } },
     });
     removed += count;
   }
-  return { removed, total: await prisma.activeListingProduct.count({ where: { tenantId } }) };
+  return { removed, total: await prisma.activeListingProduct.count() };
 }
 
 export async function clearAllActiveListings(): Promise<number> {
-  const tenantId = currentTenantId();
-  const { count } = await prisma.activeListingProduct.deleteMany({ where: { tenantId } });
+  const { count } = await prisma.activeListingProduct.deleteMany();
   return count;
 }
 
 export async function getActiveGlobalCount(): Promise<number> {
-  const tenantId = currentTenantId();
-  return prisma.activeListingProduct.count({ where: { tenantId } });
+  return prisma.activeListingProduct.count();
 }
 
 export type ActivePricePatch = {
@@ -354,7 +319,6 @@ export type ActivePricePatch = {
 export async function applyActivePricesByAsin(
   prices: Record<string, ActivePricePatch>
 ): Promise<number> {
-  const tenantId = currentTenantId();
   const entries = Object.entries(prices).filter(
     ([, data]) => data.price != null && Number.isFinite(data.price)
   );
@@ -370,7 +334,7 @@ export async function applyActivePricesByAsin(
   const asinList = Array.from(priceMap.keys());
   const rows = await prisma.$queryRaw<{ listingKey: string; payload: FinderListing }[]>`
     SELECT "listingKey", payload FROM "ActiveListingProduct"
-    WHERE "tenantId" = ${tenantId} AND upper(payload->>'amazon_asin') = ANY(${asinList}::text[])
+    WHERE upper(payload->>'amazon_asin') = ANY(${asinList}::text[])
   `;
 
   let updated = 0;

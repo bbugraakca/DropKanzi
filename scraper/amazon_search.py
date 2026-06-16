@@ -23,12 +23,11 @@ import time
 from curl_cffi.requests import AsyncSession
 from parsel import Selector
 
-from proxy_http import ensure_proxy
+from proxy import get_proxy_url
 from image_match import image_match as siglip_match
 from asin_util import is_plausible_asin
 import proxy_meter
 import match_cache
-from semantic import semantic_cosine
 
 logger = logging.getLogger("pricehawk.amazon_search")
 
@@ -146,8 +145,7 @@ AMAZON_SEARCH_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.amazon.com/",
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "sec-ch-ua-mobile": "?1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
 _JUNK_RE = re.compile(
@@ -232,7 +230,8 @@ def _search_queries(title: str) -> list[str]:
 
 
 def _proxies() -> dict | None:
-    return ensure_proxy("residential")
+    url = get_proxy_url()
+    return {"http": url, "https": url} if url else None
 
 
 def _serp_is_blocked(text: str) -> bool:
@@ -459,10 +458,6 @@ def _tokens(text: str) -> list[str]:
     ]
 
 
-def extract_model_tokens(text: str) -> set[str]:
-    return {t for t in _tokens(text) if any(ch.isdigit() for ch in t) and len(t) >= 4}
-
-
 def _bigram_overlap(q_tokens: list[str], t_tokens: list[str]) -> float:
     if len(q_tokens) < 2:
         return 0.0
@@ -491,33 +486,28 @@ def _content_score(query: str, title: str) -> float:
 
     bigram = _bigram_overlap(q_tokens, t_tokens)
 
-    lexical = 0.40 * f1 + 0.25 * recall + 0.20 * model_hit + 0.15 * bigram
+    score = 0.40 * f1 + 0.25 * recall + 0.20 * model_hit + 0.15 * bigram
 
     # Penalise accessory listings when the eBay title isn't an accessory.
     if _ACCESSORY_RE.search(title) and not _ACCESSORY_RE.search(query):
-        lexical *= 0.45
+        score *= 0.45
 
     # First meaningful token is often the brand — penalise if missing on Amazon.
     if q_tokens and t_tokens and len(q_tokens[0]) >= 4:
         lead = q_tokens[:2]
         if not any(tok in t for tok in lead):
-            lexical *= 0.62
+            score *= 0.62
 
     # Penalise Amazon titles with many extra tokens (often wrong variant/model).
     extra = t - q
     if len(extra) > max(4, len(q) * 0.55):
-        lexical *= 0.72
+        score *= 0.72
 
     # Model/size tokens in the eBay title must appear on Amazon when present.
     if q_models and model_hit < 0.5:
-        lexical *= 0.35
+        score *= 0.35
 
-    try:
-        semantic = semantic_cosine(query, title)
-    except Exception:
-        semantic = lexical
-    score = 0.55 * semantic + 0.45 * lexical
-    return round(min(max(score, 0.0), 1.0), 3)
+    return round(min(score, 1.0), 3)
 
 
 async def fetch_serp(
@@ -677,7 +667,7 @@ async def search_amazon_candidates(
 ) -> tuple[list[dict], bool]:
     """Return organic Amazon results from search page. Second value: proxy_used."""
     if prefer_no_proxy is None:
-        prefer_no_proxy = False
+        prefer_no_proxy = not _SERP_USE_PROXY
     if not query:
         return [], False
     if captcha_abort():

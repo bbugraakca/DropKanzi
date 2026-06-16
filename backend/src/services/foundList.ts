@@ -1,12 +1,9 @@
-import { prisma, currentTenantId } from "./db";
-import { parseNumericFilter, parseSortColumn } from "./sqlFilter";
-import { sqlTenantWhere } from "./sqlUtils";
+import { prisma } from "./db";
 import { mergeListing, dedupeGroupKey, isBetterListing, type FinderListing } from "./foundProducts";
 import { Prisma } from "@prisma/client";
 import { isPlausibleAsin } from "../utils/asin";
 import {
   enrichListingProfit,
-  ACCEPTED_MATCH_SQL,
   HAS_PRICE_SQL,
   minMarginWhereSql,
   minMatchConfidenceWhereSql,
@@ -48,18 +45,18 @@ function profitParams(query: FoundPageQuery): ProfitQueryParams {
 }
 
 const SORT_SQL: Record<FoundSortKey, string> = {
-  profit: `NULLIF(payload->>'net_profit', '')::double precision DESC NULLS LAST`,
-  margin: `NULLIF(payload->>'margin_percent', '')::double precision DESC NULLS LAST`,
+  profit: `(payload->>'net_profit')::double precision DESC NULLS LAST`,
+  margin: `(payload->>'margin_percent')::double precision DESC NULLS LAST`,
   sold_date: `payload->>'sold_date' DESC NULLS LAST`,
-  sold_price: `NULLIF(payload->>'sold_price', '')::double precision DESC NULLS LAST`,
-  quantity: `NULLIF(payload->>'quantity_sold', '')::int DESC NULLS LAST`,
-  match: `NULLIF(payload->>'match_confidence', '')::double precision DESC NULLS LAST`,
+  sold_price: `(payload->>'sold_price')::double precision DESC NULLS LAST`,
+  quantity: `(payload->>'quantity_sold')::int DESC NULLS LAST`,
+  match: `(payload->>'match_confidence')::double precision DESC NULLS LAST`,
 };
 
-function buildWhere(query: FoundPageQuery, paramStart = 1): { sql: string; params: unknown[] } {
+function buildWhere(query: FoundPageQuery): { sql: string; params: unknown[] } {
   const parts: string[] = ["1=1"];
   const params: unknown[] = [];
-  let i = paramStart;
+  let i = 1;
 
   if (query.seller?.trim()) {
     const seller = query.seller.trim();
@@ -90,30 +87,22 @@ function buildWhere(query: FoundPageQuery, paramStart = 1): { sql: string; param
     parts.push(MISSING_PRICE_SQL);
   }
   if (query.minMatchConfidence != null && query.minMatchConfidence > 0) {
-    const conf = parseNumericFilter(query.minMatchConfidence, { min: 0, exclusiveMin: true });
-    if (conf !== undefined) {
-      const match = minMatchConfidenceWhereSql(conf, i);
-      parts.push(match.sql);
-      params.push(...match.params);
-      i += match.params.length;
-    }
+    const match = minMatchConfidenceWhereSql(query.minMatchConfidence, i);
+    parts.push(match.sql);
+    params.push(...match.params);
+    i += match.params.length;
   }
   if (query.minMargin != null && query.minMargin > 0) {
-    const marginVal = parseNumericFilter(query.minMargin, { min: 0, exclusiveMin: true });
-    if (marginVal !== undefined) {
-      const margin = minMarginWhereSql(marginVal, profitParams(query), i);
-      parts.push(margin.sql);
-      params.push(...margin.params);
-      i += margin.params.length;
-    }
+    const margin = minMarginWhereSql(query.minMargin, profitParams(query), i);
+    parts.push(margin.sql);
+    params.push(...margin.params);
+    i += margin.params.length;
   }
-  const minSold = parseNumericFilter(query.minSoldPrice, { min: 0, exclusiveMin: true });
-  if (minSold !== undefined) {
+  if (query.minSoldPrice != null && query.minSoldPrice > 0) {
     parts.push(
-      `(NULLIF(payload->>'sold_price', '')::double precision) >= $${i}::double precision`
+      `(NULLIF(payload->>'sold_price', '')::double precision) >= $${i++}`
     );
-    params.push(minSold);
-    i++;
+    params.push(query.minSoldPrice);
   }
 
   return { sql: parts.join(" AND "), params };
@@ -128,18 +117,12 @@ export async function listFoundPage(query: FoundPageQuery): Promise<{
   const page = Math.max(1, query.page ?? 1);
   const limit = Math.min(1000, Math.max(1, query.limit ?? 50));
   const offset = (page - 1) * limit;
-  const tenantId = currentTenantId();
   const { sql: whereSql, params } = buildWhere(query);
-  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
-  const sortKey = parseSortColumn(
-    query.sort,
-    Object.keys(SORT_SQL) as FoundSortKey[],
-    "profit"
-  );
+  const sortKey = query.sort && SORT_SQL[query.sort] ? query.sort : "profit";
   const orderSql = SORT_SQL[sortKey];
 
   const countRows = await prisma.$queryRawUnsafe<{ c: bigint }[]>(
-    `SELECT COUNT(*)::bigint AS c FROM "FoundProduct" WHERE ${whereWithTenant}`,
+    `SELECT COUNT(*)::bigint AS c FROM "FoundProduct" WHERE ${whereSql}`,
     ...params
   );
   const total = Number(countRows[0]?.c ?? 0);
@@ -147,7 +130,7 @@ export async function listFoundPage(query: FoundPageQuery): Promise<{
   const limitIdx = params.length + 1;
   const offsetIdx = params.length + 2;
   const rows = await prisma.$queryRawUnsafe<{ payload: FinderListing; listingKey: string }[]>(
-    `SELECT payload, "listingKey" FROM "FoundProduct" WHERE ${whereWithTenant} ORDER BY ${orderSql} LIMIT $${limitIdx}::int OFFSET $${offsetIdx}::int`,
+    `SELECT payload, "listingKey" FROM "FoundProduct" WHERE ${whereSql} ORDER BY ${orderSql} LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     ...params,
     limit,
     offset
@@ -169,8 +152,6 @@ let statsCache: {
   key: string;
   data: {
     total: number;
-    matched: number;
-    with_price: number;
     missing_prices: number;
     profitable: number;
     total_profit: number;
@@ -190,8 +171,6 @@ export function invalidateFoundStatsCache(): void {
 
 type FoundStatsRow = {
   total: number;
-  matched: number;
-  with_price: number;
   missing_prices: number;
   profitable: number;
   total_profit: number;
@@ -200,9 +179,7 @@ type FoundStatsRow = {
 };
 
 async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStatsRow> {
-  const tenantId = currentTenantId();
   const { sql: whereSql, params: whereParams } = buildWhere(query);
-  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const pq = profitParams(query);
   const i = whereParams.length + 1;
   const profitable = profitableWhereSql(pq, i);
@@ -213,8 +190,6 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
   const rows = await prisma.$queryRawUnsafe<
     {
       total: bigint;
-      matched: bigint;
-      with_price: bigint;
       missing_prices: bigint;
       profitable: bigint;
       total_profit: number | null;
@@ -224,8 +199,6 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
   >(
     `SELECT
       COUNT(*)::bigint AS total,
-      COUNT(*) FILTER (WHERE ${ACCEPTED_MATCH_SQL})::bigint AS matched,
-      COUNT(*) FILTER (WHERE ${HAS_PRICE_SQL})::bigint AS with_price,
       COUNT(*) FILTER (
         WHERE payload->>'amazon_asin' IS NOT NULL
           AND (payload->>'amazon_price' IS NULL OR payload->>'amazon_price' = '')
@@ -235,15 +208,13 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
       COALESCE(AVG((${marginExpr})) FILTER (WHERE ${profitable.sql}), 0)::double precision AS avg_margin,
       COALESCE(SUM((${sold}) * ${qty}), 0)::double precision AS total_revenue
     FROM "FoundProduct"
-    WHERE ${whereWithTenant}`,
+    WHERE ${whereSql}`,
     ...whereParams,
     ...profitable.params
   );
   const row = rows[0];
   return {
     total: Number(row?.total ?? 0),
-    matched: Number(row?.matched ?? 0),
-    with_price: Number(row?.with_price ?? 0),
     missing_prices: Number(row?.missing_prices ?? 0),
     profitable: Number(row?.profitable ?? 0),
     total_profit: Math.round(Number(row?.total_profit ?? 0) * 100) / 100,
@@ -276,12 +247,11 @@ export async function getFoundStatsForQuery(query: FoundPageQuery): Promise<Foun
 }
 
 export async function listMissingPriceAsins(limit = 1000): Promise<string[]> {
-  const tenantId = currentTenantId();
   const cap = Math.min(1000, Math.max(1, limit));
   const rows = await prisma.$queryRaw<{ asin: string }[]>`
     SELECT DISTINCT payload->>'amazon_asin' AS asin
     FROM "FoundProduct"
-    WHERE "tenantId" = ${tenantId} AND payload->>'amazon_asin' IS NOT NULL
+    WHERE payload->>'amazon_asin' IS NOT NULL
       AND (payload->>'amazon_price' IS NULL OR payload->>'amazon_price' = '')
       AND payload->>'amazon_asin' ~ '[0-9]'
     LIMIT ${cap * 2}
@@ -290,14 +260,13 @@ export async function listMissingPriceAsins(limit = 1000): Promise<string[]> {
 }
 
 export async function listFoundSellers(): Promise<string[]> {
-  const tenantId = currentTenantId();
   const rows = await prisma.$queryRaw<{ name: string }[]>`
     SELECT DISTINCT name FROM (
       SELECT seller AS name FROM "FoundProduct"
-      WHERE "tenantId" = ${tenantId} AND seller IS NOT NULL AND seller <> ''
+      WHERE seller IS NOT NULL AND seller <> ''
       UNION
       SELECT payload->>'source_seller' AS name FROM "FoundProduct"
-      WHERE "tenantId" = ${tenantId} AND payload->>'source_seller' IS NOT NULL AND payload->>'source_seller' <> ''
+      WHERE payload->>'source_seller' IS NOT NULL AND payload->>'source_seller' <> ''
     ) s
     ORDER BY name ASC
     LIMIT 500
@@ -307,11 +276,10 @@ export async function listFoundSellers(): Promise<string[]> {
 
 /** How many Found rows exist per source seller (for watchlist UI). */
 export async function countFoundBySeller(): Promise<Record<string, number>> {
-  const tenantId = currentTenantId();
   const rows = await prisma.$queryRaw<{ seller: string; count: bigint }[]>`
     SELECT seller, COUNT(*)::bigint AS count
     FROM "FoundProduct"
-    WHERE "tenantId" = ${tenantId} AND seller IS NOT NULL AND seller <> ''
+    WHERE seller IS NOT NULL AND seller <> ''
     GROUP BY seller
   `;
   const out: Record<string, number> = {};
@@ -330,7 +298,6 @@ export type FoundPricePatch = {
 export async function applyFoundPricesByAsin(
   prices: Record<string, FoundPricePatch>
 ): Promise<number> {
-  const tenantId = currentTenantId();
   const entries = Object.entries(prices).filter(
     ([, data]) => data.price != null && Number.isFinite(data.price)
   );
@@ -346,7 +313,7 @@ export async function applyFoundPricesByAsin(
   const asinList = Array.from(priceMap.keys());
   const rows = await prisma.$queryRaw<{ listingKey: string; payload: FinderListing }[]>`
     SELECT "listingKey", payload FROM "FoundProduct"
-    WHERE "tenantId" = ${tenantId} AND upper(payload->>'amazon_asin') = ANY(${asinList}::text[])
+    WHERE upper(payload->>'amazon_asin') = ANY(${asinList}::text[])
   `;
 
   let updated = 0;
@@ -375,9 +342,7 @@ export async function applyFoundPricesByAsin(
 
 /** Remove duplicate Found rows (same ASIN, eBay listing, or title). Keeps best profit row. */
 export async function dedupeFoundProducts(): Promise<{ removed: number; total: number }> {
-  const tenantId = currentTenantId();
   const rows = await prisma.foundProduct.findMany({
-    where: { tenantId },
     select: { listingKey: true, payload: true },
   });
 
@@ -411,9 +376,9 @@ export async function dedupeFoundProducts(): Promise<{ removed: number; total: n
   }
 
   await prisma.foundProduct.deleteMany({
-    where: { tenantId, listingKey: { in: Array.from(toDelete) } },
+    where: { listingKey: { in: Array.from(toDelete) } },
   });
   invalidateFoundStatsCache();
-  const total = await prisma.foundProduct.count({ where: { tenantId } });
+  const total = await prisma.foundProduct.count();
   return { removed: toDelete.size, total };
 }

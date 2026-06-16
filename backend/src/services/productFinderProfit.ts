@@ -86,16 +86,11 @@ export function enrichListingProfit(
   return { ...listing, ...calculateProductFinderProfit(sold, amazon, params) };
 }
 
-/** Bind index for a numeric parameter (Prisma raw queries may send text). */
-function sqlNum(idx: number): string {
-  return `$${idx}::double precision`;
-}
-
 /** SQL fragment: row is profitable given sold + Amazon prices. */
 export function netProfitExprSql(vatParamIdx: number, feeParamIdx: number): string {
   const sold = `(NULLIF(payload->>'sold_price', '')::double precision)`;
   const amazon = `(NULLIF(payload->>'amazon_price', '')::double precision)`;
-  return `(${sold} * ${REVENUE_AFTER_FEES} - ${amazon} * (1 + ${sqlNum(vatParamIdx)}) - ${sqlNum(feeParamIdx)})`;
+  return `(${sold} * ${REVENUE_AFTER_FEES} - ${amazon} * (1 + $${vatParamIdx}) - $${feeParamIdx})`;
 }
 
 export function profitableWhereSql(
@@ -110,7 +105,7 @@ export function profitableWhereSql(
     AND ${sold} > 0 AND ${amazon} > 0
     AND ${net} > 0
   )`;
-  return { sql, params: [params.vatRate ?? 0, params.additionalFee ?? 0].map(Number) };
+  return { sql, params: [params.vatRate ?? 0, params.additionalFee ?? 0] };
 }
 
 export function minMarginWhereSql(
@@ -124,12 +119,9 @@ export function minMarginWhereSql(
   const sql = `(
     ${sold} IS NOT NULL AND ${amazon} IS NOT NULL
     AND ${sold} > 0 AND ${amazon} > 0
-    AND (${net} / ${sold} * 100) >= ${sqlNum(startIdx)}
+    AND (${net} / ${sold} * 100) >= $${startIdx}
   )`;
-  return {
-    sql,
-    params: [Number(minMargin), Number(params.vatRate ?? 0), Number(params.additionalFee ?? 0)],
-  };
+  return { sql, params: [minMargin, params.vatRate ?? 0, params.additionalFee ?? 0] };
 }
 
 export function effectiveMatchConfidenceSql(): string {
@@ -143,15 +135,6 @@ export function effectiveMatchConfidenceSql(): string {
   )`;
 }
 
-/** Rows with Amazon ASIN accepted at the default 80% bar (or description match). */
-export const ACCEPTED_MATCH_SQL = `(
-  payload->>'amazon_asin' IS NOT NULL
-  AND (
-    payload->>'match_method' = 'description'
-    OR ${effectiveMatchConfidenceSql()} >= 0.8
-  )
-)`;
-
 export function minMatchConfidenceWhereSql(
   minConfidence: number,
   startIdx: number
@@ -162,10 +145,10 @@ export function minMatchConfidenceWhereSql(
       payload->>'amazon_asin' IS NOT NULL
       AND (
         payload->>'match_method' = 'description'
-        OR ${conf} >= ${sqlNum(startIdx)}
+        OR ${conf} >= $${startIdx}
       )
     )`,
-    params: [Number(minConfidence)],
+    params: [minConfidence],
   };
 }
 

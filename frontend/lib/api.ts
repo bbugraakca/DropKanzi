@@ -8,7 +8,7 @@ import type {
   ScrapeJob,
   Store,
 } from "./types";
-import { browserApiBase, browserLibraryApiBase } from "./backendUrl";
+import { browserApiBase, browserDirectBackendBase, browserLibraryApiBase } from "./backendUrl";
 
 function formatRequestError(err: unknown, url: string): Error {
   const msg = err instanceof Error ? err.message : String(err);
@@ -47,13 +47,8 @@ async function apiFetch<T>(
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const body = data as { error?: string; message?: string; detail?: string };
-      const detail = body.detail;
-      let base =
-        body.error?.trim() ||
-        body.message?.trim() ||
-        (typeof detail === "string" ? detail.trim() : "") ||
-        `Request failed (${res.status})`;
+      const detail = (data as { detail?: string }).detail;
+      let base = (data as { error?: string }).error || `Request failed (${res.status})`;
       if (
         res.status === 500 &&
         !base &&
@@ -370,9 +365,6 @@ export type ProductFinderSummary = {
   total_profit: number;
   truncated: boolean;
   truncated_at?: number | null;
-  /** Found/Live server stats — Amazon buy-box prices loaded. */
-  with_price?: number;
-  missing_prices?: number;
   prices_fetched?: boolean;
   prices_loaded?: number;
   match_groups_total?: number;
@@ -409,22 +401,6 @@ export type ProductFinderResult = {
   summary: ProductFinderSummary;
 };
 
-export type PfScanJob = {
-  id: string;
-  tenantId: string;
-  seller: string;
-  scanType: "sold" | "active";
-  daysBack: number;
-  forceRefresh: boolean;
-  status: "queued" | "active" | "done" | "failed" | "canceled";
-  stage?: string | null;
-  progress?: Record<string, unknown> | null;
-  error?: string | null;
-  result?: Record<string, unknown> | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
 export async function analyzeSeller(
   seller: string,
   daysBack: number,
@@ -442,6 +418,7 @@ export async function analyzeSeller(
       fetchPrices,
     }),
     timeoutMs: 1_800_000,
+    baseUrl: browserDirectBackendBase(),
   });
 }
 
@@ -462,6 +439,7 @@ export async function analyzeActiveSeller(
     }),
     // Full-store live scans (no match cap) can take hours for big sellers.
     timeoutMs: 7_200_000,
+    baseUrl: browserDirectBackendBase(),
   });
 }
 
@@ -490,35 +468,7 @@ export async function fetchFinderPrices(asins: string[]): Promise<FinderPriceRes
     method: "POST",
     body: JSON.stringify({ asins: asins.slice(0, 1000) }),
     timeoutMs: n >= 200 ? 900_000 : 600_000,
-  });
-}
-
-export async function postPfScan(input: {
-  seller: string;
-  scanType: "sold" | "active";
-  daysBack?: number;
-  forceRefresh?: boolean;
-  fetchPrices?: boolean;
-  storeSettings?: Record<string, unknown>;
-}): Promise<{ jobId: string; created: boolean }> {
-  return apiFetch<{ jobId: string; created: boolean }>("/pf-scan", {
-    method: "POST",
-    body: JSON.stringify(input),
-    timeoutMs: 30_000,
-  });
-}
-
-export async function getPfScanJobs(status?: string): Promise<{ jobs: PfScanJob[] }> {
-  const q = status ? `?status=${encodeURIComponent(status)}` : "";
-  return apiFetch<{ jobs: PfScanJob[] }>(`/pf-scan/jobs${q}`, {
-    timeoutMs: 30_000,
-  });
-}
-
-export async function cancelPfScan(jobId: string): Promise<{ cancelled: boolean; status: string }> {
-  return apiFetch<{ cancelled: boolean; status: string }>(`/pf-scan/${encodeURIComponent(jobId)}/cancel`, {
-    method: "POST",
-    timeoutMs: 30_000,
+    baseUrl: browserDirectBackendBase(),
   });
 }
 
@@ -578,8 +528,6 @@ export type FoundPageResponse = {
   limit: number;
   stats?: {
     total: number;
-    matched: number;
-    with_price: number;
     missing_prices: number;
     profitable: number;
     total_profit?: number;
@@ -590,8 +538,6 @@ export type FoundPageResponse = {
 
 export type FoundStats = {
   total: number;
-  matched: number;
-  with_price: number;
   missing_prices: number;
   profitable: number;
   total_profit?: number;

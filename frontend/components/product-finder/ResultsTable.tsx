@@ -464,18 +464,6 @@ export function ResultsTable({
     });
   };
 
-  const listTotal = serverMode ? (serverTotal ?? summary.total_listings) : summary.total_listings;
-  const matchedCount = summary.matched_to_amazon;
-  const unmappedInFilter = Math.max(0, listTotal - matchedCount);
-  const pricedCount =
-    summary.with_price ??
-    Math.max(0, listTotal - (serverMode ? (serverMissingPrices ?? 0) : (summary.missing_prices ?? 0)));
-  const missingPriceCount = serverMode
-    ? (serverMissingPrices ?? summary.missing_prices ?? 0)
-    : (summary.missing_prices ?? 0);
-  /** When every row in the filter already has an ASIN, show priced count instead of duplicating matched. */
-  const showPricedAsSecondCard = Boolean(serverMode && unmappedInFilter === 0);
-
   return (
     <div className="space-y-5">
       {statsScopeLabel ? (
@@ -484,28 +472,14 @@ export function ResultsTable({
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           label={statsFiltered ? "Filtered listings" : "Sold listings"}
-          value={listTotal.toLocaleString()}
+          value={summary.total_listings.toLocaleString()}
           hint={summary.truncated ? `Capped at ${summary.truncated_at ?? 5000}` : undefined}
           icon={Package}
         />
         <StatCard
-          label={
-            showPricedAsSecondCard
-              ? statsFiltered
-                ? "Amazon priced (filter)"
-                : "Amazon priced"
-              : statsFiltered
-                ? "Matched (filter)"
-                : "Matched to Amazon"
-          }
-          value={(showPricedAsSecondCard ? pricedCount : matchedCount).toLocaleString()}
-          hint={
-            showPricedAsSecondCard
-              ? missingPriceCount > 0
-                ? `${missingPriceCount.toLocaleString()} without price · use Fetch prices`
-                : "All rows have Amazon price"
-              : `${summary.match_rate.toFixed(0)}% match rate`
-          }
+          label={statsFiltered ? "Matched (filter)" : "Matched to Amazon"}
+          value={summary.matched_to_amazon.toLocaleString()}
+          hint={`${summary.match_rate.toFixed(0)}% match rate`}
           icon={Target}
         />
         <StatCard

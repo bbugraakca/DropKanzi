@@ -154,10 +154,6 @@ export function slimFinderListing(l: FinderListing): FinderListing {
   return out;
 }
 
-export function listingsForStorage(listings: FinderListing[]): FinderListing[] {
-  return listings.map(slimFinderListing);
-}
-
 export function acceptedListingsForClient(listings: FinderListing[]): FinderListing[] {
   return listings.filter(isAcceptedMatch).map(slimFinderListing);
 }
