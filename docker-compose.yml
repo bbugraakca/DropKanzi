@@ -1,0 +1,172 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pricehawk}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-pricehawk}"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env
+    environment:
+      BULK_CONCURRENCY: ${BULK_CONCURRENCY:-40}
+      BULK_RETRY_ATTEMPTS: ${BULK_RETRY_ATTEMPTS:-3}
+      BULK_SESSION_POOL: ${BULK_SESSION_POOL:-6}
+      REDIS_URL: ${REDIS_URL}
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: ${BACKEND_PORT:-3001}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      SCRAPER_URL: ${SCRAPER_URL}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      EBAY_CLIENT_ID: ${EBAY_CLIENT_ID:-}
+      EBAY_CLIENT_SECRET: ${EBAY_CLIENT_SECRET:-}
+      EBAY_REDIRECT_URI: ${EBAY_REDIRECT_URI:-}
+      EBAY_SANDBOX: ${EBAY_SANDBOX:-false}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scraper:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env
+    command: ["node", "dist/workers/scrapeWorker.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      SCRAPER_URL: ${SCRAPER_URL}
+      BULK_CONCURRENCY: ${BULK_CONCURRENCY:-40}
+      BULK_CHUNK_SIZE: ${BULK_CHUNK_SIZE:-100}
+      BULK_PARALLEL_CHUNKS: ${BULK_PARALLEL_CHUNKS:-2}
+      BULK_UPSERT_PARALLEL: ${BULK_UPSERT_PARALLEL:-20}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-3}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scraper:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  worker-pf:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env
+    command: ["node", "dist/workers/pfScanWorker.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      SCRAPER_URL: ${SCRAPER_URL}
+      PF_SCAN_BUDGET_USD: ${PF_SCAN_BUDGET_USD:-2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scraper:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  worker-pf-reprice:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env
+    command: ["node", "dist/workers/pfRepriceWorker.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      SCRAPER_URL: ${SCRAPER_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scraper:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        BACKEND_INTERNAL_URL: http://backend:3001/api
+    restart: always
+    environment:
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      BACKEND_INTERNAL_URL: http://backend:3001/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
