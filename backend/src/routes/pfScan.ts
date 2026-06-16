@@ -1,8 +1,9 @@
 import { Router } from "express";
+import type IORedis from "ioredis";
 import { cancelPfScan, createPfScanJob, getPfScanJobById, listPfScanJobs } from "../services/pfScanJob";
 import { tenantFromRequest } from "../services/tenant";
 import { requirePfAuth } from "../middleware/auth";
-import { createRedisClient } from "../services/redis";
+import { createRedisSubscriber, subscribeWhenReady } from "../services/redis";
 
 export const pfScanRouter = Router();
 pfScanRouter.use(requirePfAuth);
@@ -64,37 +65,52 @@ pfScanRouter.get("/stream", async (req, res) => {
   }
   const row = await getPfScanJobById(jobId);
   if (!row) return res.status(404).json({ error: "job not found" });
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
 
-  const redis = createRedisClient(`pf-scan-stream:${jobId}`);
+  let redis: IORedis | null = null;
   const channel = `pf:progress:${jobId}`;
-  await redis.subscribe(channel);
 
   const send = (event: string, payload: unknown) => {
+    if (res.writableEnded) return;
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
 
-  send("ready", { jobId, tenantId, job: row });
+  try {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
 
-  redis.on("message", (_ch, message) => {
-    try {
-      send("progress", JSON.parse(message));
-    } catch {
-      send("progress", { jobId, raw: message });
+    redis = createRedisSubscriber(`pf-scan-stream:${jobId}`);
+
+    redis.on("message", (_ch, message) => {
+      try {
+        send("progress", JSON.parse(message));
+      } catch {
+        send("progress", { jobId, raw: message });
+      }
+    });
+
+    await subscribeWhenReady(redis, channel);
+    send("ready", { jobId, tenantId, job: row });
+
+    const ping = setInterval(() => {
+      send("ping", { at: Date.now() });
+    }, 15_000);
+
+    req.on("close", () => {
+      clearInterval(ping);
+      void redis?.unsubscribe(channel).catch(() => undefined);
+      void redis?.quit().catch(() => undefined);
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[pf-scan-stream:${jobId}] subscribe failed: ${message}`);
+    void redis?.quit().catch(() => undefined);
+    if (!res.headersSent) {
+      return res.status(503).json({ error: "Redis unavailable for progress stream" });
     }
-  });
-
-  const ping = setInterval(() => {
-    send("ping", { at: Date.now() });
-  }, 15_000);
-
-  req.on("close", () => {
-    clearInterval(ping);
-    void redis.unsubscribe(channel).catch(() => undefined);
-    void redis.quit().catch(() => undefined);
-  });
+    send("error", { error: "Redis unavailable", detail: message });
+    res.end();
+  }
 });
