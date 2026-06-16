@@ -4,7 +4,7 @@ Multi-strategy Amazon matching engine (v3).
 Pipeline (stop at first match with confidence >= STOP_CONFIDENCE):
   1. Pre-extracted / ASIN in title (verified)
   2. MPN / model number exact search
-  3. SigLIP semantic image match + SERP candidates
+  3. Multi-signal scoring (UPC/MPN/brand/pHash/title) + SERP candidates
   4. Claude title clean + multi-query search (optional, needs ANTHROPIC_API_KEY)
   5. Claude Vision + search (optional)
   6. Multi-keyword search fallback (content scoring)
@@ -35,7 +35,22 @@ from amazon_search import (
     _search_queries,
 )
 from asin_util import is_plausible_asin
-from image_match import IMAGE_CHECK_MAX_TEXT, image_match as siglip_match
+from image_match import IMAGE_CHECK_MAX_TEXT, PHASH_MAX_DISTANCE, MATCH_SCORE_THRESHOLD, score_candidates
+from match_score import score_candidates_ranked
+from claude_arbitration import (
+    claude_arbitration_enabled,
+    claude_calls_this_run,
+    reset_run_context,
+    should_accept_asin_assignment,
+    try_claude_arbitration,
+)
+from claude_client import (
+    VisionNotAllowedError,
+    get_claude_client,
+    send_to_claude,
+    title_clean_success as is_title_clean_success,
+)
+from ebay_title_normalize import normalize_ebay_title
 
 logger = logging.getLogger("pricehawk.amazon_matcher")
 
@@ -52,27 +67,6 @@ _MPN_NOISE = frozenset(
     {"FAST", "SHIP", "SHIPS", "FREE", "NEW", "USED", "OPEN", "BOX", "SEALED"}
 )
 
-_claude_client: Any = None
-
-
-def _claude_enabled() -> bool:
-    return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
-
-
-def _get_claude() -> Any | None:
-    global _claude_client
-    if not _claude_enabled():
-        return None
-    if _claude_client is None:
-        try:
-            import anthropic
-
-            _claude_client = anthropic.AsyncAnthropic()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Anthropic client unavailable: %s", exc)
-            return None
-    return _claude_client
-
 
 def _parse_json_response(text: str) -> dict:
     text = text.strip()
@@ -82,10 +76,30 @@ def _parse_json_response(text: str) -> dict:
 
 
 FINDER_CLAUDE_MATCH = os.getenv("FINDER_CLAUDE_MATCH", "false").lower() in ("1", "true", "yes")
+FINDER_CLAUDE_TITLE_IMAGE = os.getenv("FINDER_CLAUDE_TITLE_IMAGE", "false").lower() in ("1", "true", "yes")
 FINDER_VISION_MATCH = os.getenv("FINDER_VISION_MATCH", "false").lower() in ("1", "true", "yes")
-FINDER_MAX_SERP_QUERIES = int(os.getenv("FINDER_MAX_SERP_QUERIES", "2"))
+FINDER_MAX_SERP_QUERIES = int(os.getenv("FINDER_MAX_SERP_QUERIES", "3"))
 FINDER_MAX_MATCH_GROUPS = int(os.getenv("FINDER_MAX_MATCH_GROUPS", "600"))
 FINDER_SERP_CANDIDATES = int(os.getenv("FINDER_SERP_CANDIDATES", "8"))
+
+
+def _title_clean_mode() -> str:
+    """
+    off — never call Claude for title cleaning (cheapest).
+    lazy — local SERP first; Claude only if that fails (default when legacy MATCH=true).
+    always — Claude before every SERP attempt (expensive; ~300k tokens/seller scan).
+    """
+    raw = os.getenv("FINDER_CLAUDE_TITLE_CLEAN")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower()
+    if FINDER_CLAUDE_MATCH:
+        return "lazy"
+    return "off"
+
+
+def _uses_claude_api() -> bool:
+    return _title_clean_mode() in ("lazy", "always") or claude_arbitration_enabled()
+
 
 _match_method_stats: dict[str, int] = {
     "regex": 0,
@@ -158,6 +172,14 @@ def _apply_match(listing: dict, match: dict) -> dict:
             out["amazon_asin"] = None
             out["amazon_price"] = None
             out["match_confidence"] = conf
+        elif (
+            out.get("match_method") == "claude_arbitration"
+            and not should_accept_asin_assignment(str(out["amazon_asin"]).upper())
+        ):
+            out["amazon_asin"] = None
+            out["amazon_price"] = None
+            out["match_confidence"] = conf
+            out["match_method"] = "asin_reuse_rejected"
         elif out.get("amazon_price") is not None:
             out["price_source"] = match.get("price_source") or "serp"
     return out
@@ -257,12 +279,18 @@ async def _best_from_candidates(
     image_url: str | None,
     img_session: AsyncSession | None,
     original_title: str = "",
+    seller_id: str = "",
+    brand: str | None = None,
+    title_clean_success: bool = False,
 ) -> Optional[dict]:
     if not candidates:
         return None
 
     ref = reference_title
     orig = original_title or reference_title
+    idents = extract_identifiers(orig)
+    if brand:
+        idents = {**idents, "brand": brand}
     text_best: dict | None = None
     for cand in candidates:
         content = _title_content_score(ref, orig, cand["title"])
@@ -282,47 +310,73 @@ async def _best_from_candidates(
     if text_best_score >= IMAGE_CHECK_MAX_TEXT:
         return text_best
 
-    if image_url:
-        candidates_for_image = [
-            {
-                "asin": c["asin"],
-                "image_url": c.get("image", "") or c.get("image_url", ""),
-                "text_score": _title_content_score(ref, orig, c["title"]),
-                "title": c["title"],
-                "price": c.get("price"),
-            }
-            for c in sorted(
-                candidates,
-                key=lambda c: _title_content_score(ref, orig, c["title"]),
-                reverse=True,
-            )
-        ]
-
-        image_result = await siglip_match(
-            ebay_image_url=image_url,
-            candidates=candidates_for_image,
-            text_best_score=text_best_score,
+    candidates_for_score = [
+        {
+            "asin": c["asin"],
+            "image_url": c.get("image", "") or c.get("image_url", ""),
+            "text_score": _title_content_score(ref, orig, c["title"]),
+            "title": c["title"],
+            "price": c.get("price"),
+        }
+        for c in sorted(
+            candidates,
+            key=lambda c: _title_content_score(ref, orig, c["title"]),
+            reverse=True,
         )
+    ]
 
-        if image_result and image_result["combined_score"] >= 0.72:
-            amazon_title = image_result.get("title") or ""
-            conf = float(image_result["combined_score"])
-            if image_result["image_score"] >= 0.85:
-                conf = max(conf, 0.81)
-            elif image_result["image_score"] >= 0.75:
-                conf = max(conf, 0.80)
-            return {
-                "amazon_asin": image_result["asin"],
-                "amazon_price": image_result.get("price"),
-                "price_source": "serp" if image_result.get("price") is not None else None,
-                "match_confidence": round(conf, 4),
-                "match_title_score": image_result["text_score"],
-                "match_image_score": image_result["image_score"],
-                "text_score": image_result["text_score"],
-                "image_score": image_result["image_score"],
-                "match_method": "image_siglip",
-                "amazon_title": amazon_title.lower() if amazon_title else text_best.get("amazon_title"),
-            }
+    score_result = await score_candidates(
+        ebay_title=orig,
+        ebay_image_url=image_url or None,
+        candidates=candidates_for_score,
+        identifiers=idents,
+        text_best_score=text_best_score,
+    )
+
+    if score_result and int(score_result.get("match_score") or 0) >= MATCH_SCORE_THRESHOLD:
+        amazon_title = score_result.get("title") or ""
+        phash_dist = score_result.get("phash_distance")
+        image_score = (
+            max(0.0, 1.0 - (phash_dist or PHASH_MAX_DISTANCE + 1) / (PHASH_MAX_DISTANCE + 1))
+            if phash_dist is not None
+            else None
+        )
+        return {
+            "amazon_asin": score_result["asin"],
+            "amazon_price": score_result.get("price"),
+            "price_source": "serp" if score_result.get("price") is not None else None,
+            "match_confidence": float(score_result["match_confidence"]),
+            "match_title_score": score_result.get("text_score"),
+            "match_image_score": image_score,
+            "text_score": score_result.get("text_score"),
+            "image_score": image_score,
+            "match_method": score_result.get("match_method") or "score_match",
+            "amazon_title": amazon_title.lower() if amazon_title else text_best.get("amazon_title"),
+        }
+
+    ranked = await score_candidates_ranked(
+        ebay_title=orig,
+        ebay_image_url=image_url or None,
+        candidates=candidates_for_score,
+        identifiers=idents,
+        text_best_score=text_best_score,
+    )
+    mpn_hint = idents.get("mpn") or idents.get("apple_mpn") or idents.get("samsung_model")
+    claude_hit = await try_claude_arbitration(
+        ebay_title=orig,
+        ranked_candidates=ranked,
+        brand=brand or idents.get("brand"),
+        mpn=mpn_hint,
+        seller_id=seller_id,
+        claude_client=get_claude_client(),
+        title_clean_success=title_clean_success,
+    )
+    if claude_hit and float(claude_hit.get("match_confidence") or 0) >= MIN_MATCH_CONFIDENCE:
+        return claude_hit
+
+    # Strong text-only SERP hit (no image / score path missed).
+    if text_best and text_best_score >= 0.79:
+        return text_best
 
     return text_best
 
@@ -336,6 +390,8 @@ async def _match_serp_queries(
     brand: str | None = None,
     serp_session: AsyncSession | None = None,
     original_title: str = "",
+    seller_id: str = "",
+    title_clean_success: bool = False,
 ) -> Optional[dict]:
     seen_q: set[str] = set()
     best_hit: dict | None = None
@@ -379,6 +435,9 @@ async def _match_serp_queries(
             image_url,
             img_session,
             original_title=original_title,
+            seller_id=seller_id,
+            brand=brand,
+            title_clean_success=title_clean_success,
         )
         if hit:
             hit["proxy_used"] = proxy_used
@@ -413,50 +472,54 @@ async def claude_clean_title(title: str, image_url: str | None = None) -> dict:
         "clean_title": clean,
         "search_queries": _search_queries(title) or [clean],
         "asin_if_visible": None,
+        "title_clean_success": False,
     }
-    if not FINDER_CLAUDE_MATCH:
+    mode = _title_clean_mode()
+    if mode not in ("lazy", "always"):
         return fallback
-    client = _get_claude()
-    if client is None:
+
+    cached = match_cache.get_title_clean(clean)
+    if cached:
+        cached = dict(cached)
+        if "title_clean_success" not in cached:
+            cached["title_clean_success"] = is_title_clean_success(cached)
+        return cached
+
+    if get_claude_client() is None:
         return fallback
 
     image_content: list[dict] = []
-    if image_url and image_url.startswith("http"):
+    if FINDER_CLAUDE_TITLE_IMAGE and image_url and image_url.startswith("http"):
         image_content = [{"type": "image", "source": {"type": "url", "url": image_url}}]
 
-    text_prompt = f"""Analyze this eBay listing and extract structured product data for Amazon matching.
-
-eBay title: "{title}"
-
-Return ONLY valid JSON, no markdown:
-{{
-  "brand": "brand name or null",
-  "clean_title": "product name without eBay junk",
-  "search_queries": ["specific query", "medium query", "broad query"],
-  "asin_if_visible": "ASIN if in title or null"
-}}"""
+    text_prompt = (
+        f'eBay: "{title[:160]}"\n'
+        "JSON only: "
+        '{"brand":null,"clean_title":"...","search_queries":["q1","q2"],"asin_if_visible":null}'
+    )
 
     try:
-        response = await client.messages.create(
-            model=_CLAUDE_MODEL,
-            max_tokens=400,
+        response = await send_to_claude(
+            purpose="title_clean",
+            max_tokens=180,
             messages=[
                 {"role": "user", "content": image_content + [{"type": "text", "text": text_prompt}]}
             ],
         )
         data = _parse_json_response(response.content[0].text)
+        success = is_title_clean_success(data)
         if not data.get("search_queries"):
             data["search_queries"] = [data.get("clean_title") or title]
+        data["title_clean_success"] = success
+        if success:
+            match_cache.set_title_clean(clean, data)
         return data
+    except VisionNotAllowedError:
+        logger.warning("Claude title clean image blocked by vision guard")
+        return fallback
     except Exception as exc:  # noqa: BLE001
         logger.warning("Claude title clean failed: %s", exc)
-        clean = clean_query(title)
-        return {
-            "clean_title": clean,
-            "search_queries": _search_queries(title) or [clean],
-            "brand": None,
-            "asin_if_visible": None,
-        }
+        return fallback
 
 
 async def match_by_image_vision(
@@ -467,8 +530,7 @@ async def match_by_image_vision(
 ) -> Optional[dict]:
     if not FINDER_VISION_MATCH:
         return None
-    client = _get_claude()
-    if client is None or not image_url or not image_url.startswith("http"):
+    if get_claude_client() is None or not image_url or not image_url.startswith("http"):
         return None
 
     try:
@@ -485,8 +547,8 @@ async def match_by_image_vision(
             media_type = "image/jpeg"
 
         image_b64 = base64.standard_b64encode(r.content).decode("utf-8")
-        response = await client.messages.create(
-            model=_CLAUDE_MODEL,
+        response = await send_to_claude(
+            purpose="vision",
             max_tokens=220,
             messages=[
                 {
@@ -633,11 +695,58 @@ async def _match_listing_inner(
             match_cache.set_match(clean, mpn_hit)
             return _apply_match(listing, {**base, **mpn_hit})
 
+    seller_id = listing.get("source_seller") or listing.get("seller") or ""
+    clean_title = clean
+    base["clean_title"] = clean_title
+    brand: str | None = None
+    title_clean_mode = _title_clean_mode()
+
+    async def _run_serp(
+        queries: list[str],
+        ref_title: str,
+        brand_hint: str | None,
+        *,
+        title_clean_success: bool = False,
+    ) -> Optional[dict]:
+        return await _match_serp_queries(
+            queries,
+            ref_title,
+            image_url or None,
+            img_session,
+            serp_cache,
+            brand=brand_hint,
+            serp_session=serp_session,
+            original_title=title,
+            seller_id=seller_id,
+            title_clean_success=title_clean_success,
+        )
+
+    def _finalize_serp(search_hit: dict | None) -> Optional[dict]:
+        if search_hit and _success(search_hit):
+            match_cache.set_match(clean, search_hit)
+            _record_match(
+                str(search_hit.get("match_method") or "search"),
+                proxy_used=bool(search_hit.get("proxy_used")),
+                bytes_used=0,
+                confidence=float(search_hit.get("match_confidence") or 0),
+            )
+            return _apply_match(listing, {**base, **search_hit})
+        return None
+
+    local_queries = _search_queries(title) or [clean]
+    if title_clean_mode != "always":
+        hit = _finalize_serp(
+            await _run_serp(local_queries, clean_title, None, title_clean_success=False)
+        )
+        if hit:
+            return hit
+
     claude_data = await claude_clean_title(title, image_url or None)
     clean_title = claude_data.get("clean_title") or clean
     base["clean_title"] = clean_title
-    search_queries = claude_data.get("search_queries") or _search_queries(title) or [clean_title]
+    search_queries = claude_data.get("search_queries") or local_queries
     brand = claude_data.get("brand")
+    tc_success = title_clean_mode == "lazy" and bool(claude_data.get("title_clean_success"))
 
     if claude_data.get("asin_if_visible") and _valid_asin(claude_data["asin_if_visible"]):
         hit = {
@@ -649,25 +758,11 @@ async def _match_listing_inner(
         match_cache.set_match(clean, hit)
         return _apply_match(listing, hit)
 
-    search_hit = await _match_serp_queries(
-        search_queries,
-        clean_title,
-        image_url or None,
-        img_session,
-        serp_cache,
-        brand=brand,
-        serp_session=serp_session,
-        original_title=title,
+    hit = _finalize_serp(
+        await _run_serp(search_queries, clean_title, brand, title_clean_success=tc_success)
     )
-    if search_hit and _success(search_hit):
-        match_cache.set_match(clean, search_hit)
-        _record_match(
-            str(search_hit.get("match_method") or "search"),
-            proxy_used=bool(search_hit.get("proxy_used")),
-            bytes_used=0,
-            confidence=float(search_hit.get("match_confidence") or 0),
-        )
-        return _apply_match(listing, {**base, **search_hit})
+    if hit:
+        return hit
 
     if image_url:
         vision_hit = await match_by_image_vision(
@@ -745,6 +840,33 @@ def _copy_match_fields(src: dict, dst: dict) -> dict:
     return dst
 
 
+def _reject_suspicious_asin_reuse(listings: list[dict]) -> list[dict]:
+    """Claude arbitration only: same ASIN on 5+ listings in one batch is suspicious."""
+    asin_counts = Counter(
+        str(l["amazon_asin"]).upper()
+        for l in listings
+        if l.get("amazon_asin")
+        and l.get("match_method") == "claude_arbitration"
+        and _valid_asin(l["amazon_asin"])
+    )
+    suspect = {a for a, c in asin_counts.items() if c >= 5}
+    if not suspect:
+        return listings
+    out: list[dict] = []
+    for row in listings:
+        asin = str(row.get("amazon_asin") or "").upper()
+        if asin in suspect and row.get("match_method") == "claude_arbitration":
+            cleaned = dict(row)
+            cleaned["amazon_asin"] = None
+            cleaned["amazon_price"] = None
+            cleaned["match_method"] = "asin_reuse_rejected"
+            out.append(cleaned)
+        else:
+            out.append(row)
+    logger.warning("Rejected %d ASIN(s) reused on 3+ listings: %s", len(suspect), sorted(suspect)[:8])
+    return out
+
+
 async def match_listings_batch(
     listings: list[dict],
     concurrency: int = 5,
@@ -756,6 +878,8 @@ async def match_listings_batch(
         return [], {"groups_total": 0, "groups_attempted": 0, "groups_skipped": 0}
 
     from amazon_search import captcha_abort
+
+    reset_run_context()
 
     groups: dict[str, list[int]] = {}
     for i, listing in enumerate(listings):
@@ -823,7 +947,7 @@ async def match_listings_batch(
                     stats_counters["cached_miss"] += 1
                 elif res.get("amazon_asin"):
                     stats_counters["raw_matched"] += 1
-                await asyncio.sleep(0.22 if _claude_enabled() else 0.05)
+                await asyncio.sleep(0.22 if _uses_claude_api() else 0.05)
                 return res
 
         matched_reps = await asyncio.gather(*[_match_rep(r) for r in representatives])
@@ -838,6 +962,8 @@ async def match_listings_batch(
         for idx in groups[key]:
             out[idx] = _copy_match_fields(template, dict(listings[idx]))
 
+    out = _reject_suspicious_asin_reuse(out)
+
     method_counts = Counter(m.get("match_method") for m in matched_reps)
     logger.info("match_method_distribution %s", dict(method_counts))
 
@@ -849,5 +975,7 @@ async def match_listings_batch(
         "match_cached_miss": stats_counters["cached_miss"],
         "match_raw_before_filter": stats_counters["raw_matched"],
         "match_methods": dict(method_counts),
+        "claude_arbitration_calls": claude_calls_this_run(),
+        "asin_reuse_rejected": method_counts.get("asin_reuse_rejected", 0),
     }
     return out, stats

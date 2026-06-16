@@ -4,19 +4,14 @@ export function serverBackendApiBase(): string {
   const raw =
     process.env.BACKEND_INTERNAL_URL ||
     process.env.BACKEND_URL ||
-    "http://localhost:3001/api";
+    "http://127.0.0.1:3001/api";
   return raw.replace(/\/$/, "");
 }
 
-/** Browser: same-origin /api rewrite in Docker, or direct backend when NEXT_PUBLIC_API_URL set. */
+/** Browser: always same-origin /api — Next rewrites to backend (avoids Windows localhost/wslrelay 502). */
 export function browserApiBase(): string {
   if (typeof window === "undefined") {
     return serverBackendApiBase();
-  }
-  const pub = process.env.NEXT_PUBLIC_API_URL?.trim();
-  if (pub) {
-    // Windows: localhost often resolves to ::1 and hits wslrelay instead of Docker.
-    return pub.replace(/\/$/, "").replace("://localhost", "://127.0.0.1");
   }
   return "/api";
 }
@@ -33,10 +28,7 @@ export function browserDirectBackendBase(): string {
   return "http://127.0.0.1:3001/api";
 }
 
-/** Saved/Reserved library — always same-origin /api proxy (reliable on Windows/Docker). */
+/** Saved/Reserved library — same as browserApiBase (single proxy path). */
 export function browserLibraryApiBase(): string {
-  if (typeof window === "undefined") {
-    return serverBackendApiBase();
-  }
-  return "/api";
+  return browserApiBase();
 }

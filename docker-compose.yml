@@ -62,9 +62,9 @@ services:
       - .env
     environment:
       PORT: ${BACKEND_PORT:-3001}
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-secret123}@postgres:5432/${POSTGRES_DB:-pricehawk}
+      REDIS_URL: redis://redis:6379
+      SCRAPER_URL: http://scraper:8001
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       EBAY_CLIENT_ID: ${EBAY_CLIENT_ID:-}
       EBAY_CLIENT_SECRET: ${EBAY_CLIENT_SECRET:-}
@@ -89,9 +89,9 @@ services:
       - .env
     command: ["node", "dist/workers/scrapeWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-secret123}@postgres:5432/${POSTGRES_DB:-pricehawk}
+      REDIS_URL: redis://redis:6379
+      SCRAPER_URL: http://scraper:8001
       BULK_CONCURRENCY: ${BULK_CONCURRENCY:-40}
       BULK_CHUNK_SIZE: ${BULK_CHUNK_SIZE:-100}
       BULK_PARALLEL_CHUNKS: ${BULK_PARALLEL_CHUNKS:-2}

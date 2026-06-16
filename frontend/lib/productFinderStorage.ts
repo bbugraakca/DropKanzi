@@ -7,6 +7,8 @@ export const RESERVED_KEY = "pf_reserved_products";
 export const DELETED_FOUND_KEYS = "pf_deleted_found_keys";
 export const QUEUE_KEY = "pf_queue";
 export const SELLER_HISTORY_KEY = "pf_seller_history";
+/** Sellers explicitly removed from watchlist — do not re-add from queue/history merge. */
+export const REMOVED_SELLERS_KEY = "pf_removed_sellers";
 /** Max unique sellers in watchlist (weekly refresh list). */
 export const SELLER_HISTORY_MAX = 250;
 export const WEEKLY_REFRESH_DAYS = 7;
@@ -220,6 +222,55 @@ export function writeQueueLocal(items: StoredQueueItem[]): void {
   }
 }
 
+export function readRemovedSellers(): Set<string> {
+  try {
+    const raw = localStorage.getItem(REMOVED_SELLERS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(
+      parsed.filter((s): s is string => typeof s === "string" && s.length > 0).map((s) => s.toLowerCase())
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function writeRemovedSellers(keys: Set<string>): void {
+  try {
+    localStorage.setItem(
+      REMOVED_SELLERS_KEY,
+      JSON.stringify(Array.from(keys).slice(-500))
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+export function markSellerRemoved(seller: string): void {
+  const key = seller.trim().toLowerCase();
+  if (!key) return;
+  const next = readRemovedSellers();
+  next.add(key);
+  writeRemovedSellers(next);
+}
+
+/** User queued or imported this seller again — allow watchlist entry. */
+export function unmarkSellerRemoved(seller: string): void {
+  const key = seller.trim().toLowerCase();
+  if (!key) return;
+  const next = readRemovedSellers();
+  if (!next.delete(key)) return;
+  writeRemovedSellers(next);
+}
+
+/** Drop queued/running rows for a seller (watchlist delete). */
+export function removeSellerFromQueue(seller: string): void {
+  const key = seller.trim().toLowerCase();
+  const next = readQueueLocal().filter((it) => it.seller.toLowerCase() !== key);
+  writeQueueLocal(next);
+}
+
 export function normalizeAsin(asin: string | null | undefined): string | null {
   if (!asin) return null;
   const t = asin.trim().toUpperCase();
@@ -429,6 +480,7 @@ export function rememberSellerSearches(
   entries: ArchiveSellerScanInput[]
 ): StoredSellerSearch[] {
   if (entries.length === 0) return readSellerHistory();
+  const removed = readRemovedSellers();
   const now = Date.now();
   const map = new Map<string, StoredSellerSearch>();
   for (const prev of readSellerHistory()) {
@@ -438,6 +490,7 @@ export function rememberSellerSearches(
     const seller = e.seller.trim().replace(/^@/, "");
     if (!seller) return;
     const key = seller.toLowerCase();
+    if (removed.has(key)) return;
     const prev = map.get(key);
     map.set(key, {
       seller,
@@ -491,6 +544,9 @@ export function importSellersToWatchlist(
   if (entries.length === 0) {
     return { added: 0, total: uniqueSellerHistory().length, truncated: false };
   }
+  for (const e of entries) {
+    unmarkSellerRemoved(e.seller);
+  }
   const before = new Set(readSellerHistory().map((e) => e.seller.toLowerCase()));
   const next = rememberSellerSearches(entries);
   const added = entries.filter((e) => !before.has(e.seller.toLowerCase())).length;
@@ -508,12 +564,17 @@ export function archiveSellerScan(entry: ArchiveSellerScanInput): StoredSellerSe
 
 export function removeSellerFromHistory(seller: string): StoredSellerSearch[] {
   const key = seller.trim().toLowerCase();
+  markSellerRemoved(seller);
+  removeSellerFromQueue(seller);
   const next = readSellerHistory().filter((e) => e.seller.toLowerCase() !== key);
   writeSellerHistory(next);
   return next;
 }
 
 export function clearSellerHistory(): void {
+  for (const e of readSellerHistory()) {
+    markSellerRemoved(e.seller);
+  }
   try {
     localStorage.removeItem(SELLER_HISTORY_KEY);
   } catch {

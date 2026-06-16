@@ -5,7 +5,7 @@ import { Search } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Checkbox } from "@/components/ui/Checkbox";
-import { rememberSellerSearches } from "@/lib/productFinderStorage";
+import { rememberSellerSearches, unmarkSellerRemoved } from "@/lib/productFinderStorage";
 import { parseEbaySellerInput } from "@/lib/parseEbaySellerInput";
 import { cn } from "@/lib/utils";
 
@@ -47,6 +47,7 @@ export function SellerSearch({
       const key = parsed.seller.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      unmarkSellerRemoved(parsed.seller);
       queued.push({
         seller: parsed.seller,
         daysBack: days,

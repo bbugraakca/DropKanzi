@@ -316,7 +316,18 @@ export function FoundProductsPanel({
     void loadPage(queryRef.current, { silent: true, withStats: true });
   }, [storeSettings, loadPage]);
 
-  const summary = useMemo(() => buildSummary(stats), [stats]);
+  const summary = useMemo(() => {
+    const base = buildSummary(stats);
+    const displayTotal = activeSellerFilter
+      ? stats.total
+      : Math.max(globalFoundTotal, stats.total);
+    return {
+      ...base,
+      total_listings: displayTotal,
+      matched_to_amazon: displayTotal,
+      match_rate: displayTotal > 0 ? 100 : 0,
+    };
+  }, [stats, globalFoundTotal, activeSellerFilter]);
 
   const handleServerQueryChange = useCallback(
     (patch: Partial<FoundPageParams>) => {
@@ -426,7 +437,7 @@ export function FoundProductsPanel({
     }
   }, [reload]);
 
-  const filteredEmpty = !loading && total === 0 && stats.total > 0;
+  const filteredEmpty = !loading && total === 0 && (stats.total > 0 || globalFoundTotal > 0);
   const emptyContent = useMemo(() => {
     if (loading && listings.length === 0) {
       return (
@@ -443,7 +454,8 @@ export function FoundProductsPanel({
       return (
         <div className="space-y-3">
           <p>
-            {stats.total.toLocaleString()} products in Found, but none match the current filters
+            {(activeSellerFilter ? stats.total : globalFoundTotal).toLocaleString()} products in
+            Found, but none match the current filters
             {activeSellerFilter ? ` (seller: ${activeSellerFilter})` : ""}.
           </p>
           <p className="text-xs">
@@ -455,7 +467,7 @@ export function FoundProductsPanel({
         </div>
       );
     }
-    if (total === 0) {
+    if (total === 0 && globalFoundTotal === 0) {
       return <p>No matched products in Found yet. Queue a seller to scan.</p>;
     }
     return null;
@@ -466,6 +478,7 @@ export function FoundProductsPanel({
     filteredEmpty,
     stats.total,
     activeSellerFilter,
+    globalFoundTotal,
     total,
     clearAllFilters,
   ]);

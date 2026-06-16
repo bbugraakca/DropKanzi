@@ -214,6 +214,9 @@ EBAY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
+# eBay sold search: 240 per page (dropdown at bottom of results — max practical page size).
+EBAY_ITEMS_PER_PAGE = str(min(240, max(50, int(os.getenv("EBAY_ITEMS_PER_PAGE", "240")))))
+
 # ASINs are 10 chars; modern ones are B0XXXXXXXX. Tightened to avoid matching
 # random 10-char tokens in page HTML.
 from asin_util import is_plausible_asin, normalize_asin, _ASIN_LABELED_RE
@@ -262,6 +265,33 @@ def _parse_card_price(card) -> float | None:
     return None
 
 
+def _parse_card_sold_caption(card) -> str:
+    """Collect sold/ended date text from modern s-card and legacy s-item markup."""
+    parts: list[str] = []
+    for sel in (
+        ".s-card__caption ::text",
+        ".s-card__caption .su-styled-text ::text",
+        ".s-card__footer ::text",
+        ".s-item__ended-date ::text",
+        ".s-item__endedDate ::text",
+        ".s-item__title--tagblock ::text",
+        ".s-item__title--tagblock .POSITIVE ::text",
+        ".s-item__subtitle ::text",
+        "span.POSITIVE ::text",
+        ".s-item__detail--primary ::text",
+        ".s-item__details ::text",
+    ):
+        for x in card.css(sel).getall():
+            t = x.strip()
+            if t and t not in parts:
+                parts.append(t)
+    return " ".join(parts)
+
+
+def _ebay_items_per_page_param() -> str:
+    return EBAY_ITEMS_PER_PAGE
+
+
 def _parse_card_title(card) -> str:
     for sel in (
         ".s-card__title .su-styled-text::text",
@@ -296,14 +326,7 @@ def _parse_card_from_element(card) -> dict | None:
         m = re.search(r"/itm/(\d+)", url)
         listing_id = m.group(1) if m else listing_id
 
-    caption = " ".join(
-        x.strip()
-        for x in card.css(
-            ".s-card__caption ::text, .s-card__caption .su-styled-text ::text, "
-            ".s-item__title--tagblock .POSITIVE ::text, .s-item__subtitle ::text"
-        ).getall()
-        if x.strip()
-    )
+    caption = _parse_card_sold_caption(card)
     sold_date = parse_ebay_date(caption)
 
     attrs = " ".join(
@@ -417,7 +440,7 @@ async def _fetch_seller_search(
     """Fetch seller search HTML (sold/completed or all active listings)."""
     params: dict[str, str] = {
         "_ssn": seller,
-        "_ipg": "240",
+        "_ipg": _ebay_items_per_page_param(),
         "_pgn": str(page),
         "rt": "nc",
     }
@@ -479,7 +502,7 @@ def _build_sold_search_params(
         "_ssn": ssn,
         "LH_Sold": "1",
         "LH_Complete": "1",
-        "_ipg": "240",
+        "_ipg": _ebay_items_per_page_param(),
         "_pgn": str(page),
         "_sop": "13",
         "rt": "nc",
@@ -499,7 +522,7 @@ def _build_active_search_params(
     """Active/live listings search — no LH_Sold/LH_Complete."""
     params: dict[str, str] = {
         "_ssn": ssn,
-        "_ipg": "240",
+        "_ipg": _ebay_items_per_page_param(),
         "_pgn": str(page),
         "_sop": "12",
         "rt": "nc",
@@ -707,8 +730,7 @@ async def _scrape_seller_sold_listings_inner(
             if not page_items:
                 break  # end of results
 
-            # eBay returns Best-Match order (NOT by date), so filter each page
-            # rather than breaking on the first old item.
+            # _sop=13 → ended recently (not best-match); filter by sold_date window per page.
             in_window = [
                 it
                 for it in page_items
@@ -780,10 +802,43 @@ def parse_sold_listings(html: str) -> list[dict]:
 
 
 def parse_ebay_date(date_str: str) -> Optional[datetime]:
-    """Parse common eBay date formats, e.g. 'Sold  May 14, 2025'."""
+    """Parse eBay sold captions: absolute dates, year-less, and relative ('3 days ago')."""
     if not date_str:
         return None
-    text = re.sub(r"^(Sold|Ended)\b", "", date_str.strip(), flags=re.IGNORECASE).strip()
+    text = re.sub(r"^(Sold|Ended|Completed)\b", "", date_str.strip(), flags=re.IGNORECASE).strip()
+    if not text:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    low = text.lower()
+    if low in ("today", "just now"):
+        return now
+    if low == "yesterday":
+        return (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+
+    rel = re.search(
+        r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago",
+        low,
+    )
+    if rel:
+        n = int(rel.group(1))
+        unit = rel.group(2)
+        if unit.startswith("second"):
+            delta = timedelta(seconds=n)
+        elif unit.startswith("minute"):
+            delta = timedelta(minutes=n)
+        elif unit.startswith("hour"):
+            delta = timedelta(hours=n)
+        elif unit.startswith("day"):
+            delta = timedelta(days=n)
+        elif unit.startswith("week"):
+            delta = timedelta(weeks=n)
+        elif unit.startswith("month"):
+            delta = timedelta(days=n * 30)
+        else:
+            delta = timedelta(days=n * 365)
+        return (now - delta).replace(hour=12, minute=0, second=0, microsecond=0)
 
     # Prefer an explicit "Mon DD, YYYY" / "DD Mon YYYY" / "MM/DD/YYYY" substring.
     candidates = [text]
@@ -796,6 +851,10 @@ def parse_ebay_date(date_str: str) -> Optional[datetime]:
     m = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
     if m:
         candidates.insert(0, m.group(0))
+    # Year omitted: "Mar 15" / "March 15"
+    m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2})\b", text)
+    if m and not re.search(r"\d{4}", text):
+        candidates.insert(0, f"{m.group(1)} {m.group(2)}, {now.year}")
 
     formats = ["%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y", "%m/%d/%Y", "%m/%d/%y"]
     for cand in candidates:
@@ -803,7 +862,12 @@ def parse_ebay_date(date_str: str) -> Optional[datetime]:
         for fmt in formats:
             try:
                 dt = datetime.strptime(cand, fmt)
-                return dt.replace(tzinfo=timezone.utc)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                # If year-less parse landed in the future, assume previous year.
+                if dt > now + timedelta(days=2):
+                    dt = dt.replace(year=dt.year - 1)
+                return dt
             except ValueError:
                 continue
     return None

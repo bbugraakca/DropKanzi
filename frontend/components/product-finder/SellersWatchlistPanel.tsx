@@ -124,6 +124,7 @@ export function SellersWatchlistPanel({
   onRefreshMany,
   onRefreshAll,
   onChanged,
+  onSellerRemoved,
   onViewInFound,
   onViewInActive,
   onScanActive,
@@ -139,6 +140,8 @@ export function SellersWatchlistPanel({
   onRefreshMany: (entries: StoredSellerSearch[]) => void;
   onRefreshAll: () => void;
   onChanged?: () => void;
+  /** Drop seller from in-memory queue when removed from watchlist. */
+  onSellerRemoved?: (seller: string) => void;
   onViewInFound: (seller: string) => void;
   onViewInActive: (seller: string) => void;
   onScanActive: (seller: string) => void;
@@ -329,6 +332,9 @@ export function SellersWatchlistPanel({
               size="sm"
               type="button"
               onClick={() => {
+                for (const e of history) {
+                  onSellerRemoved?.(e.seller);
+                }
                 clearSellerHistory();
                 setHistory([]);
                 setSelected(new Set());
@@ -614,6 +620,7 @@ export function SellersWatchlistPanel({
                           type="button"
                           onClick={() => {
                             setHistory(removeSellerFromHistory(entry.seller));
+                            onSellerRemoved?.(entry.seller);
                             onChanged?.();
                           }}
                           className="rounded-md p-1.5 text-muted-foreground hover:bg-surface-muted hover:text-foreground"

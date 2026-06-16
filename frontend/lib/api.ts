@@ -49,6 +49,9 @@ async function apiFetch<T>(
     if (!res.ok) {
       const detail = (data as { detail?: string }).detail;
       let base = (data as { error?: string }).error || `Request failed (${res.status})`;
+      if ((res.status === 502 || res.status === 503) && !base) {
+        base = `Backend unavailable (${res.status}) — run: docker compose up -d backend frontend scraper`;
+      }
       if (
         res.status === 500 &&
         !base &&
@@ -603,6 +606,36 @@ export async function fetchFoundStats(): Promise<FoundStats> {
   return apiFetch<FoundStats>("/product-finder/found/stats", { timeoutMs: 30_000 });
 }
 
+export type PfTabSummary = {
+  found: number;
+  active: number;
+  saved: number;
+  reserved: number;
+};
+
+/** Single request for all Product Finder tab badge counts. */
+export async function fetchPfSummary(): Promise<PfTabSummary> {
+  return apiFetch<PfTabSummary>("/product-finder/summary", { timeoutMs: 30_000 });
+}
+
+export async function fetchPfSummaryWithRetry(
+  retries = 3,
+  delayMs = 1500
+): Promise<PfTabSummary> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fetchPfSummary();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries - 1) {
+        await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 export async function fetchFoundSellers(): Promise<{ sellers: string[] }> {
   return apiFetch<{ sellers: string[] }>("/product-finder/found/sellers", { timeoutMs: 30_000 });
 }
@@ -874,13 +907,43 @@ export async function dedupeFoundProducts(): Promise<{ removed: number; total: n
 
 export type LibraryBucket = "saved" | "reserved";
 
+export async function fetchLibraryPage(
+  bucket: LibraryBucket,
+  offset = 0,
+  limit = 500
+): Promise<{ listings: ProductFinderListing[]; total: number }> {
+  const res = await apiFetch<{
+    listings: ProductFinderListing[];
+    count: number;
+    total: number;
+  }>(
+    `/product-finder/library?bucket=${bucket}&offset=${offset}&limit=${limit}`,
+    { timeoutMs: 120_000, baseUrl: browserLibraryApiBase() }
+  );
+  return {
+    listings: res.listings ?? [],
+    total: res.total ?? res.count ?? (res.listings?.length ?? 0),
+  };
+}
+
 export async function fetchLibraryProducts(
   bucket: LibraryBucket
 ): Promise<{ listings: ProductFinderListing[]; count: number }> {
-  return apiFetch<{ listings: ProductFinderListing[]; count: number }>(
-    `/product-finder/library?bucket=${bucket}`,
-    { timeoutMs: 120_000, baseUrl: browserLibraryApiBase() }
-  );
+  const PAGE = 500;
+  const all: ProductFinderListing[] = [];
+  let offset = 0;
+  let total = 0;
+
+  for (let page = 0; page < 40; page++) {
+    const res = await fetchLibraryPage(bucket, offset, PAGE);
+    const batch = res.listings;
+    total = res.total;
+    all.push(...batch);
+    offset += batch.length;
+    if (batch.length === 0 || all.length >= total) break;
+  }
+
+  return { listings: all, count: all.length };
 }
 
 export async function syncLibraryProducts(

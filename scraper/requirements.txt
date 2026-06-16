@@ -1,4 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cpu
 fastapi==0.110.0
 uvicorn==0.27.0
 curl_cffi==0.6.2
@@ -9,9 +8,5 @@ Pillow==10.3.0
 redis==5.0.1
 anthropic>=0.40.0
 requests==2.31.0
-numpy<2
-sentencepiece>=0.1.99
-protobuf>=3.20.0
-transformers==4.40.0
-torch==2.2.0+cpu
-torchvision==0.17.0+cpu
+imagehash==4.3.1
+sentence-transformers>=2.7.0

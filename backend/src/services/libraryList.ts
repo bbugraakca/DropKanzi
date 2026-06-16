@@ -28,12 +28,33 @@ function slimListings(listings: FinderListing[]): FinderListing[] {
 }
 
 export async function listLibrary(bucket: LibraryBucket): Promise<FinderListing[]> {
-  const rows = await prisma.pfLibraryProduct.findMany({
-    where: { bucket },
-    orderBy: { updatedAt: "desc" },
-    take: 5000,
-  });
-  return rows.map((r) => r.payload as FinderListing);
+  const { listings } = await listLibraryPage(bucket, { offset: 0, limit: 5000 });
+  return listings;
+}
+
+export async function listLibraryPage(
+  bucket: LibraryBucket,
+  opts?: { offset?: number; limit?: number }
+): Promise<{ listings: FinderListing[]; total: number }> {
+  const offset = Math.max(0, opts?.offset ?? 0);
+  const limit = Math.min(1000, Math.max(1, opts?.limit ?? 500));
+  const [rows, total] = await Promise.all([
+    prisma.pfLibraryProduct.findMany({
+      where: { bucket },
+      orderBy: { updatedAt: "desc" },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.pfLibraryProduct.count({ where: { bucket } }),
+  ]);
+  return {
+    listings: rows.map((r) => r.payload as FinderListing),
+    total,
+  };
+}
+
+export async function countLibrary(bucket: LibraryBucket): Promise<number> {
+  return prisma.pfLibraryProduct.count({ where: { bucket } });
 }
 
 /** Replace entire bucket with the given listings (deduped by listingKey). */

@@ -160,6 +160,8 @@ const SavedRow = memo(function SavedRow({
 
 export function SavedProductsPanel({
   saved,
+  totalCount,
+  loading = false,
   panelMode = "saved",
   onUnsave,
   onUnsaveMany,
@@ -171,6 +173,9 @@ export function SavedProductsPanel({
   storeSettings,
 }: {
   saved: ProductFinderListing[];
+  /** Server/tab total — may differ from loaded rows until lazy load completes. */
+  totalCount?: number;
+  loading?: boolean;
   panelMode?: "saved" | "reserved";
   onUnsave: (listing: ProductFinderListing) => void;
   onUnsaveMany?: (listings: ProductFinderListing[]) => void;
@@ -184,6 +189,7 @@ export function SavedProductsPanel({
 }) {
   const isReserved = panelMode === "reserved";
   const itemLabel = isReserved ? "reserved" : "saved";
+  const displayTotal = totalCount ?? saved.length;
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(0);
   const [query, setQuery] = useState("");
@@ -385,6 +391,18 @@ export function SavedProductsPanel({
     copyListings(listings);
   };
 
+  if (loading) {
+    return (
+      <div className="pf-panel pf-empty">
+        <Loader2 className="mb-3 h-7 w-7 animate-spin text-text-3" aria-hidden />
+        <p className="text-[14px] font-medium text-text-1">
+          Loading {displayTotal > 0 ? `${displayTotal.toLocaleString()} ` : ""}
+          {itemLabel} products…
+        </p>
+      </div>
+    );
+  }
+
   if (saved.length === 0) {
     return (
       <div className="pf-panel pf-empty">
@@ -393,9 +411,11 @@ export function SavedProductsPanel({
           {isReserved ? "No reserved products yet" : "No saved products yet"}
         </p>
         <p className="mt-1 max-w-sm text-[13px] text-text-3">
-          {isReserved
-            ? "Copy from Saved — items move here and stay on the server."
-            : "Add from Found — saved to the database, not just this browser."}
+          {displayTotal > 0
+            ? `${displayTotal.toLocaleString()} on server — open tab again or refresh if this persists.`
+            : isReserved
+              ? "Copy from Saved — items move here and stay on the server."
+              : "Add from Found — saved to the database, not just this browser."}
         </p>
       </div>
     );
@@ -407,11 +427,11 @@ export function SavedProductsPanel({
         <div className="text-[13px] font-medium text-text-1">
           {filtersActive ? (
             <>
-              {filtered.length} of {saved.length} {itemLabel}
+              {filtered.length} of {displayTotal} {itemLabel}
             </>
           ) : (
             <>
-              {saved.length} {itemLabel} {saved.length === 1 ? "product" : "products"}
+              {displayTotal} {itemLabel} {displayTotal === 1 ? "product" : "products"}
             </>
           )}
           {filtered.length > PAGE_SIZE ? (

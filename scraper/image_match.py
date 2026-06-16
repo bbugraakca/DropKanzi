@@ -1,240 +1,166 @@
 """
-SigLIP-based semantic image matching.
-Replaces dHash perceptual hashing.
+Public matching API — routes to scoring (default) or SigLIP legacy (rollback).
 
-Model: google/siglip-base-patch16-224
-RAM: ~400MB
-Inference: ~150ms/image on CPU
+MADDE 10: SigLIP code lives in image_match_siglip.py; NOT loaded unless
+FINDER_VISION_MATCH=true.
 """
 
-import asyncio
-import logging
+from __future__ import annotations
+
 import os
-import time
-from io import BytesIO
 from typing import Optional
 
-import requests as req_sync
-import torch
-from PIL import Image
-from transformers import AutoModel, AutoProcessor
+from match_score import (
+    IMAGE_CHECK_MAX_TEXT,
+    IMAGE_CHECK_MIN_TEXT,
+    MATCH_SCORE_THRESHOLD,
+    PHASH_MAX_DISTANCE,
+    MULTI_SIGNAL_MIN_SCORE,
+    clear_phash_cache,
+    compute_score,
+    extract_brand,
+    extract_mpns,
+    extract_upc,
+    get_phash,
+    get_phash_sync,
+    match_min_gap,
+    match_score_threshold,
+    mpn_in_title,
+    normalize_mpn,
+    phash_cache_size,
+    phash_hamming,
+    phash_max_distance,
+    qualifies_match,
+    score_candidates as _score_candidates,
+    score_to_confidence,
+    title_similarity,
+    upc_matches,
+    warmup as _score_warmup,
+)
 
-logger = logging.getLogger("pricehawk.image_match")
-
-MODEL_NAME = os.environ.get("SIGLIP_MODEL", "google/siglip-base-patch16-224")
-IMAGE_TIMEOUT = int(os.environ.get("IMAGE_DOWNLOAD_TIMEOUT", "8"))
-IMAGE_CHECK_MIN_TEXT = float(os.environ.get("IMAGE_CHECK_MIN_TEXT", "0.38"))
-IMAGE_CHECK_MAX_TEXT = float(os.environ.get("IMAGE_CHECK_MAX_TEXT", "0.81"))
-MAX_IMAGE_CANDIDATES = int(os.environ.get("FINDER_IMAGE_CANDIDATES", "5"))
-
-_processor = None
-_model = None
-_model_lock = asyncio.Lock()
-
-
-async def _get_model():
-    """Lazy load SigLIP model once, keep in memory."""
-    global _processor, _model
-    if _model is not None:
-        return _processor, _model
-
-    async with _model_lock:
-        if _model is not None:
-            return _processor, _model
-
-        logger.info("[SigLIP] Loading model %s...", MODEL_NAME)
-        t0 = time.time()
-
-        loop = asyncio.get_event_loop()
-        _processor, _model = await loop.run_in_executor(None, _load_model_sync)
-
-        logger.info("[SigLIP] Model loaded in %.1fs", time.time() - t0)
-        return _processor, _model
+FINDER_VISION_MATCH = os.getenv("FINDER_VISION_MATCH", "false").lower() in ("1", "true", "yes")
 
 
-def _load_model_sync():
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME)
-    model.eval()
-    return processor, model
+def vision_match_enabled() -> bool:
+    return FINDER_VISION_MATCH
 
 
-def _download_image_sync(url: str, timeout: int = 8) -> Optional[Image.Image]:
-    """Download image synchronously. No proxy — CDN images are public."""
-    if not url or not url.startswith("http"):
-        return None
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "image/webp,image/avif,image/*,*/*;q=0.8",
+async def score_candidates(
+    *,
+    ebay_title: str,
+    ebay_image_url: Optional[str],
+    candidates: list[dict],
+    identifiers: Optional[dict] = None,
+    text_best_score: float = 0.0,
+) -> Optional[dict]:
+    if FINDER_VISION_MATCH:
+        from image_match_siglip import image_match as siglip_match
+
+        if not ebay_image_url:
+            return None
+        result = await siglip_match(
+            ebay_image_url,
+            candidates,
+            text_best_score,
+            ebay_title=ebay_title,
+            identifiers=identifiers,
+        )
+        if not result:
+            return None
+        conf = float(result.get("combined_score") or 0)
+        return {
+            **result,
+            "asin": result.get("asin"),
+            "match_score": int(conf * 100),
+            "match_confidence": conf,
+            "match_method": "image_siglip",
         }
-        r = req_sync.get(url, headers=headers, timeout=timeout, stream=True)
-        if r.status_code != 200:
-            return None
-        content_type = r.headers.get("content-type", "")
-        if content_type and "image" not in content_type:
-            return None
-        data = b""
-        for chunk in r.iter_content(1024):
-            data += chunk
-            if len(data) > 1_048_576:
-                break
-        return Image.open(BytesIO(data)).convert("RGB")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("[SigLIP] Image download failed %s: %s", url, exc)
-        return None
-
-
-async def _download_image(url: str) -> Optional[Image.Image]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _download_image_sync, url, IMAGE_TIMEOUT)
-
-
-def _embed_images_sync(processor, model, images: list[Image.Image]) -> torch.Tensor:
-    """Return L2-normalized image embeddings. Shape: (N, D)."""
-    inputs = processor(images=images, return_tensors="pt", padding=True)
-    with torch.no_grad():
-        embeddings = model.get_image_features(**inputs)
-    embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
-    return embeddings
-
-
-async def _embed_images(images: list[Image.Image]) -> Optional[torch.Tensor]:
-    if not images:
-        return None
-    processor, model = await _get_model()
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _embed_images_sync, processor, model, images)
-
-
-def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Cosine similarity between two 1D tensors."""
-    return float(torch.dot(a, b).item())
+    return await _score_candidates(
+        ebay_title=ebay_title,
+        ebay_image_url=ebay_image_url,
+        candidates=candidates,
+        identifiers=identifiers,
+        text_best_score=text_best_score,
+    )
 
 
 async def image_match(
     ebay_image_url: str,
     candidates: list[dict],
     text_best_score: float,
+    *,
+    ebay_title: str = "",
+    identifiers: Optional[dict] = None,
 ) -> Optional[dict]:
-    """
-    Run SigLIP image matching between eBay listing image and Amazon candidates.
+    if FINDER_VISION_MATCH:
+        from image_match_siglip import image_match as siglip_match
 
-    Args:
-        ebay_image_url: URL of eBay product thumbnail
-        candidates: list of dicts with keys: asin, image_url, text_score
-                    Already sorted by text_score descending.
-        text_best_score: highest text score across all candidates
-
-    Returns:
-        Best match dict with added keys: image_score, combined_score, match_method
-        Or None if image matching cannot improve the result.
-    """
-    if text_best_score >= IMAGE_CHECK_MAX_TEXT:
-        logger.debug(
-            "[SigLIP] text_score=%.2f >= %s, skip image",
+        return await siglip_match(
+            ebay_image_url,
+            candidates,
             text_best_score,
-            IMAGE_CHECK_MAX_TEXT,
-        )
-        return None
-
-    if text_best_score < IMAGE_CHECK_MIN_TEXT:
-        logger.debug(
-            "[SigLIP] text_score=%.2f < %s, skip image",
-            text_best_score,
-            IMAGE_CHECK_MIN_TEXT,
-        )
-        return None
-
-    ebay_img = await _download_image(ebay_image_url)
-    if ebay_img is None:
-        logger.debug("[SigLIP] eBay image download failed: %s", ebay_image_url)
-        return None
-
-    top_candidates = candidates[:MAX_IMAGE_CANDIDATES]
-    candidate_image_urls = [c.get("image_url", "") for c in top_candidates]
-
-    amazon_imgs = await asyncio.gather(*[_download_image(url) for url in candidate_image_urls])
-
-    valid = [(i, img) for i, img in enumerate(amazon_imgs) if img is not None]
-
-    if not valid:
-        logger.debug("[SigLIP] All Amazon image downloads failed")
-        return None
-
-    all_images = [ebay_img] + [img for _, img in valid]
-    embeddings = await _embed_images(all_images)
-
-    if embeddings is None:
-        return None
-
-    ebay_emb = embeddings[0]
-    amazon_embs = embeddings[1:]
-
-    results = []
-    for rank, (orig_idx, _) in enumerate(valid):
-        candidate = top_candidates[orig_idx]
-        image_score = cosine_similarity(ebay_emb, amazon_embs[rank])
-        text_score = float(candidate.get("text_score", 0.0))
-
-        if text_score < 0.55:
-            combined = 0.30 * text_score + 0.70 * image_score
-        elif text_score < 0.68:
-            combined = 0.40 * text_score + 0.60 * image_score
-        else:
-            combined = 0.50 * text_score + 0.50 * image_score
-
-        results.append(
-            {
-                **candidate,
-                "image_score": round(image_score, 4),
-                "combined_score": round(combined, 4),
-                "match_method": "image_siglip",
-            }
+            ebay_title=ebay_title,
+            identifiers=identifiers,
         )
 
-        logger.debug(
-            "[SigLIP] asin=%s text=%.3f image=%.3f combined=%.3f",
-            candidate.get("asin"),
-            text_score,
-            image_score,
-            combined,
-        )
-
-    if not results:
-        return None
-
-    best = max(results, key=lambda r: r["combined_score"])
-
-    accepted = False
-    if best["image_score"] >= 0.85 and best["combined_score"] >= 0.72:
-        accepted = True
-    elif best["text_score"] >= 0.55 and best["image_score"] >= 0.75:
-        accepted = True
-    elif best["text_score"] >= 0.62 and best["image_score"] >= 0.68:
-        accepted = True
-
-    if not accepted:
-        logger.debug(
-            "[SigLIP] Best candidate below threshold: text=%.3f image=%.3f combined=%.3f",
-            best["text_score"],
-            best["image_score"],
-            best["combined_score"],
-        )
-        return None
-
-    logger.info(
-        "[SigLIP] Match rescued: asin=%s text=%.3f image=%.3f combined=%.3f",
-        best.get("asin"),
-        best["text_score"],
-        best["image_score"],
-        best["combined_score"],
+    result = await _score_candidates(
+        ebay_title=ebay_title,
+        ebay_image_url=ebay_image_url,
+        candidates=candidates,
+        identifiers=identifiers,
+        text_best_score=text_best_score,
     )
-    return best
+    if not result:
+        return None
+
+    max_dist = phash_max_distance()
+    return {
+        **result,
+        "image_score": (
+            max(0.0, 1.0 - (result["phash_distance"] or max_dist + 1) / (max_dist + 1))
+            if result.get("phash_distance") is not None
+            else None
+        ),
+        "combined_score": result["match_confidence"],
+    }
 
 
 async def warmup():
-    """Call on startup to pre-load model into memory."""
-    logger.info("[SigLIP] Warming up model...")
-    await _get_model()
-    logger.info("[SigLIP] Warmup complete")
+    if FINDER_VISION_MATCH:
+        from image_match_siglip import warmup as siglip_warmup
+
+        await siglip_warmup()
+    else:
+        await _score_warmup()
+
+
+__all__ = [
+    "IMAGE_CHECK_MAX_TEXT",
+    "IMAGE_CHECK_MIN_TEXT",
+    "MATCH_SCORE_THRESHOLD",
+    "PHASH_MAX_DISTANCE",
+    "MULTI_SIGNAL_MIN_SCORE",
+    "FINDER_VISION_MATCH",
+    "vision_match_enabled",
+    "clear_phash_cache",
+    "compute_score",
+    "extract_brand",
+    "extract_mpns",
+    "extract_upc",
+    "get_phash",
+    "get_phash_sync",
+    "image_match",
+    "match_min_gap",
+    "match_score_threshold",
+    "mpn_in_title",
+    "normalize_mpn",
+    "phash_cache_size",
+    "phash_hamming",
+    "phash_max_distance",
+    "qualifies_match",
+    "score_candidates",
+    "score_to_confidence",
+    "title_similarity",
+    "upc_matches",
+    "warmup",
+]

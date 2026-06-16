@@ -20,8 +20,9 @@ import {
   mergeFoundProducts,
   removeFoundProducts,
   clearFoundProducts,
-  fetchFoundStats,
-  fetchLibraryProducts,
+  fetchPfSummary,
+  fetchPfSummaryWithRetry,
+  fetchLibraryPage,
   syncLibraryProducts,
   type LibraryBucket,
   mergeLibraryProducts,
@@ -30,7 +31,6 @@ import {
   clearLibraryProducts,
   dedupeLibraryProducts,
   dedupeFoundProducts,
-  fetchActiveStats,
   removeActiveProducts,
   restoreLibraryToFound,
   fetchArchiveStatus,
@@ -70,6 +70,7 @@ import {
   scheduleWriteReservedLocal,
   archiveSellerScan,
   rememberSellerSearches,
+  unmarkSellerRemoved,
   uniqueSellerHistory,
   WEEKLY_REFRESH_DAYS,
   type StoredSellerSearch,
@@ -96,7 +97,7 @@ type ConfirmAction =
 
 function isRetryableAnalyzeError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /api connection failed|cannot reach api|failed to fetch|fetch failed|network|502|503|504|scraper failed|scraper connection|econnrefused|enotfound|socket hang up|connection lost|backend unreachable|und_err|other side closed|siglip warmup/i.test(
+  return /api connection failed|cannot reach api|failed to fetch|fetch failed|network|502|503|504|scraper failed|scraper connection|econnrefused|enotfound|socket hang up|connection lost|backend unreachable|und_err|other side closed|matcher warmup/i.test(
     msg
   );
 }
@@ -139,14 +140,15 @@ function readReservedLocal(): ProductFinderListing[] {
 const LIBRARY_LOAD_RETRIES = 3;
 const LIBRARY_LOAD_RETRY_MS = 1500;
 
-async function fetchLibraryWithRetry(
+const LIBRARY_PAGE_SIZE = 500;
+
+async function fetchLibraryFirstPageWithRetry(
   bucket: "saved" | "reserved"
-): Promise<{ listings: ProductFinderListing[]; fromServer: boolean }> {
+): Promise<{ listings: ProductFinderListing[]; total: number }> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < LIBRARY_LOAD_RETRIES; attempt++) {
     try {
-      const res = await fetchLibraryProducts(bucket);
-      return { listings: res.listings ?? [], fromServer: true };
+      return await fetchLibraryPage(bucket, 0, LIBRARY_PAGE_SIZE);
     } catch (err) {
       lastErr = err;
       if (attempt < LIBRARY_LOAD_RETRIES - 1) {
@@ -157,6 +159,24 @@ async function fetchLibraryWithRetry(
   throw lastErr;
 }
 
+async function fetchLibraryRemainingPages(
+  bucket: "saved" | "reserved",
+  startOffset: number,
+  total: number,
+  seed: ProductFinderListing[]
+): Promise<ProductFinderListing[]> {
+  let all = [...seed];
+  let offset = startOffset;
+  while (offset < total) {
+    const page = await fetchLibraryPage(bucket, offset, LIBRARY_PAGE_SIZE);
+    const batch = page.listings ?? [];
+    if (batch.length === 0) break;
+    all = dedupeSavedByListingKey([...all, ...batch]);
+    offset += batch.length;
+  }
+  return all;
+}
+
 /** Merge browser-only rows into server when local cache has more than DB. */
 async function reconcileLibraryBucket(
   bucket: "saved" | "reserved",
@@ -164,6 +184,10 @@ async function reconcileLibraryBucket(
   localListings: ProductFinderListing[]
 ): Promise<ProductFinderListing[]> {
   let merged = dedupeSavedByListingKey(serverListings);
+
+  if (serverListings.length > 0 && localListings.length === 0) {
+    return merged;
+  }
 
   if (merged.length === 0 && localListings.length > 0) {
     await syncLibraryProducts(bucket, localListings, { force: true });
@@ -189,37 +213,47 @@ export default function ProductFinderPage() {
   const [foundRefreshKey, setFoundRefreshKey] = useState(0);
   const [activeTotal, setActiveTotal] = useState(0);
   const [activeRefreshKey, setActiveRefreshKey] = useState(0);
+  const [savedCount, setSavedCount] = useState(0);
+  const [reservedCount, setReservedCount] = useState(0);
+  const [savedLoading, setSavedLoading] = useState(false);
+  const [reservedLoading, setReservedLoading] = useState(false);
+  const [apiDegraded, setApiDegraded] = useState(false);
+  const apiErrorToastRef = useRef(false);
+  const libraryLoadedRef = useRef({ saved: false, reserved: false });
   const [focusActiveSeller, setFocusActiveSeller] = useState<string | null>(null);
   const [scanningActiveSeller, setScanningActiveSeller] = useState<string | null>(null);
   const tabRef = useRef<PfTab>("found");
   const pendingFoundRefreshRef = useRef(false);
   const pendingActiveRefreshRef = useRef(false);
 
-  const foundStatsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const refreshFoundGlobalStats = useCallback(() => {
-    if (foundStatsTimerRef.current) clearTimeout(foundStatsTimerRef.current);
-    foundStatsTimerRef.current = setTimeout(() => {
-      foundStatsTimerRef.current = null;
-      void fetchFoundStats()
-        .then((s) => {
-          setFoundTotal((prev) => (prev === s.total ? prev : s.total));
-        })
-        .catch(() => undefined);
-    }, 400);
+  const tabCountsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshTabCounts = useCallback(() => {
+    if (tabCountsTimerRef.current) clearTimeout(tabCountsTimerRef.current);
+    tabCountsTimerRef.current = setTimeout(() => {
+      tabCountsTimerRef.current = null;
+      void (async () => {
+        try {
+          const s = await fetchPfSummaryWithRetry();
+          setFoundTotal(s.found);
+          setActiveTotal(s.active);
+          setSavedCount(s.saved);
+          setReservedCount(s.reserved);
+          setApiDegraded(false);
+          apiErrorToastRef.current = false;
+        } catch (err) {
+          setApiDegraded(true);
+          if (!apiErrorToastRef.current) {
+            apiErrorToastRef.current = true;
+            const msg = err instanceof Error ? err.message : "API unavailable";
+            toast.error(msg.slice(0, 200));
+          }
+        }
+      })();
+    }, 300);
   }, []);
 
-  const activeStatsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const refreshActiveGlobalStats = useCallback(() => {
-    if (activeStatsTimerRef.current) clearTimeout(activeStatsTimerRef.current);
-    activeStatsTimerRef.current = setTimeout(() => {
-      activeStatsTimerRef.current = null;
-      void fetchActiveStats()
-        .then((s) => {
-          setActiveTotal((prev) => (prev === s.total ? prev : s.total));
-        })
-        .catch(() => undefined);
-    }, 400);
-  }, []);
+  const refreshFoundGlobalStats = refreshTabCounts;
+  const refreshActiveGlobalStats = refreshTabCounts;
 
   const bumpActive = useCallback(() => {
     refreshActiveGlobalStats();
@@ -282,85 +316,100 @@ export default function ProductFinderPage() {
     }
   }, []);
 
-  /** Load Saved/Reserved from PostgreSQL; migrate browser cache if DB empty. */
+  /** Tab badge counts — one lightweight API call on mount. */
   useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      const localSaved = dedupeSavedByListingKey(readSavedLocal());
-      const localReserved = dedupeSavedByListingKey(readReservedLocal());
-      let savedFromServer = false;
-      let reservedFromServer = false;
-      let nextSaved = localSaved;
-      let nextReserved = localReserved;
-      const errors: string[] = [];
+    refreshTabCounts();
+  }, [refreshTabCounts]);
 
+  const loadLibraryBucket = useCallback(
+    async (bucket: "saved" | "reserved", opts?: { force?: boolean }) => {
+      if (!opts?.force && libraryLoadedRef.current[bucket]) return;
+
+      const setLoading = bucket === "saved" ? setSavedLoading : setReservedLoading;
+      const local = bucket === "saved" ? readSavedLocal() : readReservedLocal();
+
+      const commitBucket = (listings: ProductFinderListing[], markLoaded: boolean) => {
+        const enriched = enrichListingsProfit(listings, storeSettingsRef.current);
+        if (bucket === "saved") {
+          setSaved(enriched);
+          savedRef.current = enriched;
+          writeSavedLocal(enriched);
+          if (markLoaded) libraryLoadedRef.current.saved = true;
+        } else {
+          setReserved(enriched);
+          reservedRef.current = enriched;
+          writeReservedLocal(enriched);
+          if (markLoaded) libraryLoadedRef.current.reserved = true;
+        }
+      };
+
+      const reconcileMerged = async (serverListings: ProductFinderListing[]) => {
+        let merged = dedupeSavedByListingKey(serverListings);
+        if (merged.length === 0 && local.length > 0) {
+          try {
+            merged = await reconcileLibraryBucket(bucket, [], local);
+          } catch {
+            merged = dedupeSavedByListingKey(local);
+          }
+        } else if (merged.length > 0 && local.length > 0) {
+          const serverKeys = new Set(merged.map((l) => listingKey(l)));
+          const localOnly = local.filter((l) => !serverKeys.has(listingKey(l)));
+          if (localOnly.length > 0) {
+            try {
+              await mergeLibraryProducts(bucket, localOnly);
+              merged = dedupeSavedByListingKey([...merged, ...localOnly]);
+            } catch {
+              /* keep server rows */
+            }
+          }
+        }
+        return merged;
+      };
+
+      setLoading(true);
       try {
-        const savedRes = await fetchLibraryWithRetry("saved");
-        if (cancelled) return;
-        savedFromServer = savedRes.fromServer;
-        try {
-          nextSaved = await reconcileLibraryBucket("saved", savedRes.listings, localSaved);
-        } catch {
-          nextSaved = dedupeSavedByListingKey(
-            savedRes.listings.length > 0 ? savedRes.listings : localSaved
-          );
+        const first = await fetchLibraryFirstPageWithRetry(bucket);
+        let merged = await reconcileMerged(first.listings ?? []);
+        commitBucket(merged, first.total <= merged.length);
+        setLoading(false);
+
+        if (merged.length < first.total) {
+          void (async () => {
+            try {
+              const full = await fetchLibraryRemainingPages(
+                bucket,
+                merged.length,
+                first.total,
+                merged
+              );
+              merged = await reconcileMerged(full);
+              commitBucket(merged, true);
+            } catch {
+              /* first page already visible */
+            } finally {
+              refreshTabCounts();
+            }
+          })();
         }
       } catch (err) {
-        errors.push(err instanceof Error ? err.message : "Saved load failed");
+        const fallback = dedupeSavedByListingKey(local);
+        commitBucket(fallback, false);
+        if (bucket === "saved") setSavedCount(fallback.length);
+        else setReservedCount(fallback.length);
+        const detail = err instanceof Error ? err.message.slice(0, 120) : "load failed";
+        toast.warning(`Could not load ${bucket} from server — using browser cache. (${detail})`);
+      } finally {
+        setLoading(false);
+        refreshTabCounts();
       }
+    },
+    [refreshTabCounts]
+  );
 
-      try {
-        const reservedRes = await fetchLibraryWithRetry("reserved");
-        if (cancelled) return;
-        reservedFromServer = reservedRes.fromServer;
-        try {
-          nextReserved = await reconcileLibraryBucket(
-            "reserved",
-            reservedRes.listings,
-            localReserved
-          );
-        } catch {
-          nextReserved = dedupeSavedByListingKey(
-            reservedRes.listings.length > 0 ? reservedRes.listings : localReserved
-          );
-        }
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : "Reserved load failed");
-      }
-
-      if (cancelled) return;
-
-      if (!savedFromServer && !reservedFromServer) {
-        setSaved(localSaved);
-        setReserved(localReserved);
-        savedRef.current = localSaved;
-        reservedRef.current = localReserved;
-        const detail = errors[0]?.slice(0, 120);
-        toast.warning(
-          detail
-            ? `Could not load Saved/Reserved from server — using browser cache. (${detail})`
-            : "Could not load Saved/Reserved from server — using browser cache."
-        );
-        return;
-      }
-
-      const enrichedSaved = enrichListingsProfit(nextSaved, storeSettingsRef.current);
-      const enrichedReserved = enrichListingsProfit(nextReserved, storeSettingsRef.current);
-      setSaved(enrichedSaved);
-      setReserved(enrichedReserved);
-      savedRef.current = enrichedSaved;
-      reservedRef.current = enrichedReserved;
-      writeSavedLocal(enrichedSaved);
-      writeReservedLocal(enrichedReserved);
-
-      if (errors.length > 0) {
-        toast.message(`Loaded partial library from server (${errors.length} bucket failed).`);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  useEffect(() => {
+    if (tab === "saved") void loadLibraryBucket("saved");
+    if (tab === "reserved") void loadLibraryBucket("reserved");
+  }, [tab, loadLibraryBucket]);
   const [addAsins, setAddAsins] = useState<string[] | null>(null);
   const [storeSettings, setStoreSettings] = useState<Record<string, unknown> | null>(null);
   const [pastSellersRefresh, setPastSellersRefresh] = useState(0);
@@ -433,10 +482,17 @@ export default function ProductFinderPage() {
   // Restore active queue only; finished runs live under Past sellers.
   useEffect(() => {
     const stored = readQueueLocal();
+    const active = stored.filter(
+      (it) =>
+        isValidSellerName(it.seller) &&
+        (it.status === "queued" || it.status === "running")
+    );
     const finished = stored.filter(
       (it) => it.status === "done" || it.status === "failed"
     );
+
     if (finished.length > 0) {
+      writeQueueLocal(active);
       rememberSellerSearches(
         finished.map((it) => ({
           seller: it.seller,
@@ -460,11 +516,6 @@ export default function ProductFinderPage() {
       setPastSellersRefresh((n) => n + 1);
     }
 
-    const active = stored.filter(
-      (it) =>
-        isValidSellerName(it.seller) &&
-        (it.status === "queued" || it.status === "running")
-    );
     if (active.length === 0 && finished.length === 0) return;
 
     queueRef.current = active.map((it) =>
@@ -480,11 +531,6 @@ export default function ProductFinderPage() {
   }, [syncQueue]);
 
   const deletedFoundRef = useRef(readDeletedFoundKeys());
-
-  useEffect(() => {
-    refreshFoundGlobalStats();
-    refreshActiveGlobalStats();
-  }, [refreshFoundGlobalStats, refreshActiveGlobalStats]);
 
   useEffect(() => {
     if (!storeId) {
@@ -855,14 +901,14 @@ export default function ProductFinderPage() {
   );
 
   const clearSaved = useCallback(() => {
-    if (savedRef.current.length === 0) return;
-    setConfirmAction({ kind: "clearSaved", count: savedRef.current.length });
-  }, []);
+    if (savedCount <= 0 && savedRef.current.length === 0) return;
+    setConfirmAction({ kind: "clearSaved", count: savedCount || savedRef.current.length });
+  }, [savedCount]);
 
   const clearReserved = useCallback(() => {
-    if (reservedRef.current.length === 0) return;
-    setConfirmAction({ kind: "clearReserved", count: reservedRef.current.length });
-  }, []);
+    if (reservedCount <= 0 && reservedRef.current.length === 0) return;
+    setConfirmAction({ kind: "clearReserved", count: reservedCount || reservedRef.current.length });
+  }, [reservedCount]);
 
   const performClearSaved = useCallback(async () => {
     try {
@@ -870,6 +916,9 @@ export default function ProductFinderPage() {
       setSaved([]);
       savedRef.current = [];
       writeSavedLocal([]);
+      setSavedCount(0);
+      libraryLoadedRef.current.saved = false;
+      refreshTabCounts();
       void refreshArchiveHints();
       toast.success(
         res.archived
@@ -879,7 +928,7 @@ export default function ProductFinderPage() {
     } catch {
       toast.error("Clear Saved failed on server — retry.");
     }
-  }, [refreshArchiveHints]);
+  }, [refreshArchiveHints, refreshTabCounts]);
 
   const performClearReserved = useCallback(async () => {
     try {
@@ -887,6 +936,9 @@ export default function ProductFinderPage() {
       setReserved([]);
       reservedRef.current = [];
       writeReservedLocal([]);
+      setReservedCount(0);
+      libraryLoadedRef.current.reserved = false;
+      refreshTabCounts();
       void refreshArchiveHints();
       toast.success(
         res.archived
@@ -896,7 +948,7 @@ export default function ProductFinderPage() {
     } catch {
       toast.error("Clear Reserved failed on server — retry.");
     }
-  }, [refreshArchiveHints]);
+  }, [refreshArchiveHints, refreshTabCounts]);
 
   const moveToReserved = useCallback(
     (listings: ProductFinderListing[]) => {
@@ -1079,7 +1131,10 @@ export default function ProductFinderPage() {
             break;
           }
           if (confirmAction.source === "found") {
+            deletedFoundRef.current = new Set();
+            writeDeletedFoundKeys(deletedFoundRef.current);
             setFoundTotal(res.foundTotal ?? 0);
+            refreshFoundGlobalStats();
             bumpFound();
             setTab("found");
           } else {
@@ -1481,6 +1536,7 @@ export default function ProductFinderPage() {
       }
 
       queuePausedRef.current = false;
+      unmarkSellerRemoved(norm);
 
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -1754,6 +1810,16 @@ export default function ProductFinderPage() {
     [refreshWatchlist7d]
   );
 
+  const handleSellerRemoved = useCallback(
+    (seller: string) => {
+      const key = seller.trim().toLowerCase();
+      queueRef.current = queueRef.current.filter((it) => it.seller.toLowerCase() !== key);
+      syncQueue();
+      setPastSellersRefresh((n) => n + 1);
+    },
+    [syncQueue]
+  );
+
   const watchlistCount = useMemo(
     () => uniqueSellerHistory().length,
     [pastSellersRefresh]
@@ -1780,8 +1846,8 @@ export default function ProductFinderPage() {
     { id: "sellers" as const, title: "Sellers", count: watchlistCount },
     { id: "found" as const, title: "Found", count: foundTotal },
     { id: "active" as const, title: "Live", count: activeTotal },
-    { id: "saved" as const, title: "Saved", count: saved.length },
-    { id: "reserved" as const, title: "Reserved", count: reserved.length },
+    { id: "saved" as const, title: "Saved", count: savedCount },
+    { id: "reserved" as const, title: "Reserved", count: reservedCount },
   ];
 
   return (
@@ -1794,6 +1860,21 @@ export default function ProductFinderPage() {
     >
       <div className="pf-page -mx-1 space-y-5">
         <SellerSearch onAnalyze={enqueue} />
+
+        {apiDegraded ? (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900">
+            API unreachable (502/500). Start stack:{" "}
+            <code className="text-xs">docker compose up -d backend frontend scraper</code>
+            {" · "}
+            <button
+              type="button"
+              className="font-medium underline"
+              onClick={() => refreshTabCounts()}
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
 
         <div className="tabs-bar sticky top-[44px] z-10 -mx-1 bg-surface px-1">
           {tabs.map((t) => (
@@ -1812,7 +1893,9 @@ export default function ProductFinderPage() {
         {activeArchive && activeArchive.count > 0 && activeArchiveSource ? (
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200/80 bg-amber-50 px-4 py-3 text-sm text-amber-950">
             <span>
-              Backup available: {activeArchive.count.toLocaleString()} {activeArchiveSource} items
+              {activeArchiveSource === "found" && foundTotal === 0
+                ? `Found is empty — backup has ${activeArchive.count.toLocaleString()} items`
+                : `Backup available: ${activeArchive.count.toLocaleString()} ${activeArchiveSource} items`}
               {activeArchive.archivedAt
                 ? ` (saved ${new Date(activeArchive.archivedAt).toLocaleString()})`
                 : ""}
@@ -1856,6 +1939,7 @@ export default function ProductFinderPage() {
               onRefreshMany={refreshWatchlist7d}
               onRefreshAll={() => refreshWatchlist7d()}
               onChanged={() => setPastSellersRefresh((n) => n + 1)}
+              onSellerRemoved={handleSellerRemoved}
               onViewInFound={viewSellerInFound}
               onViewInActive={viewSellerInActive}
               onScanActive={(seller) => scanActiveSeller(seller, true)}
@@ -1900,6 +1984,8 @@ export default function ProductFinderPage() {
           <div className={tab === "saved" ? undefined : "hidden"}>
             <SavedProductsPanel
               saved={saved}
+              totalCount={savedCount}
+              loading={savedLoading}
               panelMode="saved"
               onUnsave={unsaveOne}
               onUnsaveMany={unsaveMany}
@@ -1922,6 +2008,8 @@ export default function ProductFinderPage() {
           <div className={tab === "reserved" ? undefined : "hidden"}>
             <SavedProductsPanel
               saved={reserved}
+              totalCount={reservedCount}
+              loading={reservedLoading}
               panelMode="reserved"
               onUnsave={unreserveOne}
               onUnsaveMany={unreserveMany}

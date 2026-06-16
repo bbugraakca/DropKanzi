@@ -28,7 +28,9 @@ import {
 import type { ProfitQueryParams } from "../services/productFinderProfit";
 import {
   clearLibrary,
+  countLibrary,
   listLibrary,
+  listLibraryPage,
   mergeLibrary,
   moveLibrary,
   parseLibraryBucket,
@@ -303,7 +305,7 @@ productFinderRouter.post("/analyze", async (req, res) => {
     if (isTransientScraperError(err)) {
       console.error("[product-finder/analyze] scraper unreachable:", err);
       return res.status(503).json({
-        error: "Scraper connection lost — wait ~30s for SigLIP warmup, then retry.",
+        error: "Scraper connection lost — wait a moment for the matcher to warm up, then retry.",
         detail: err instanceof Error ? err.message : String(err),
       });
     }
@@ -489,6 +491,22 @@ productFinderRouter.get("/found", async (req, res) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Load found failed";
+    return res.status(500).json({ error: message });
+  }
+});
+
+/** GET /api/product-finder/summary — tab badge counts (one fast request). */
+productFinderRouter.get("/summary", async (_req, res) => {
+  try {
+    const [found, active, saved, reserved] = await Promise.all([
+      prisma.foundProduct.count(),
+      prisma.activeListingProduct.count(),
+      countLibrary("saved"),
+      countLibrary("reserved"),
+    ]);
+    return res.json({ found, active, saved, reserved });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Summary failed";
     return res.status(500).json({ error: message });
   }
 });
@@ -821,8 +839,23 @@ productFinderRouter.get("/library", async (req, res) => {
     return res.status(400).json({ error: "bucket must be saved or reserved" });
   }
   try {
+    const offset = Math.max(0, parseInt(String(req.query.offset ?? "0"), 10) || 0);
+    const limitRaw = parseInt(String(req.query.limit ?? "0"), 10);
+    if (limitRaw > 0) {
+      const limit = Math.min(1000, limitRaw);
+      const { listings, total } = await listLibraryPage(bucket, { offset, limit });
+      return res.json({
+        listings,
+        count: listings.length,
+        total,
+        bucket,
+        offset,
+        limit,
+      });
+    }
     const listings = await listLibrary(bucket);
-    return res.json({ listings, count: listings.length, bucket });
+    const total = await countLibrary(bucket);
+    return res.json({ listings, count: listings.length, total, bucket });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Library load failed";
     return res.status(500).json({ error: message });

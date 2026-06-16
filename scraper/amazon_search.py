@@ -24,7 +24,7 @@ from curl_cffi.requests import AsyncSession
 from parsel import Selector
 
 from proxy import get_proxy_url
-from image_match import image_match as siglip_match
+from image_match import score_candidates, MATCH_SCORE_THRESHOLD
 from asin_util import is_plausible_asin
 import proxy_meter
 import match_cache
@@ -42,7 +42,7 @@ _MIN_COMBINED = _MIN_MATCH_CONFIDENCE
 _MIN_IMAGE_ALONE = 0.62     # weak text needs decent visual match
 _MIN_IMAGE_WITH_TEXT = 0.48 # reject obvious wrong-product photos
 _MAX_CANDIDATES = int(os.getenv("FINDER_SERP_CANDIDATES", "8"))
-FINDER_MAX_SERP_QUERIES = int(os.getenv("FINDER_MAX_SERP_QUERIES", "2"))
+FINDER_MAX_SERP_QUERIES = int(os.getenv("FINDER_MAX_SERP_QUERIES", "3"))
 _SERP_TIMEOUT = 18
 _SERP_STREAM_MAX_BYTES = int(os.environ.get("SERP_STREAM_MAX_BYTES", "307200"))
 _SERP_FULL_FALLBACK_MIN_HTML = 280000
@@ -148,12 +148,7 @@ AMAZON_SEARCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
-_JUNK_RE = re.compile(
-    r"\b(new|brand new|free ship(?:ping)?|fast(?: ship(?:ping)?)?|us seller|"
-    r"oem|authentic|sealed|open box|ships? free|same day|free returns)\b",
-    re.IGNORECASE,
-)
-_QTY_RE = re.compile(r"\b(?:lot|set|pack) of \d+\b", re.IGNORECASE)
+from ebay_title_normalize import normalize_ebay_title
 _ASIN_RE = re.compile(r'data-asin="([A-Z0-9]{10})"')
 _ACCESSORY_RE = re.compile(
     r"\b(case for|cover for|compatible with|replacement for|fits for|skin for)\b",
@@ -194,10 +189,8 @@ def _parse_serp_price(node) -> float | None:
 
 def clean_query(title: str, brand: str | None = None) -> str:
     query = f"{brand} {title}" if brand else title
-    query = _QTY_RE.sub(" ", query)
-    query = _JUNK_RE.sub(" ", query)
-    query = re.sub(r"[^\w\s-]", " ", query)
-    return " ".join(query.split())[:120]
+    query = normalize_ebay_title(query)
+    return query[:120]
 
 
 def _search_queries(title: str) -> list[str]:
@@ -238,6 +231,7 @@ def _serp_is_blocked(text: str) -> bool:
     low = text.lower()
     return (
         "captcha" in low
+        or "bm-verify" in low
         or "automated access" in low
         or "type the characters you see" in low
         or "sorry, we just need to make sure you're not a robot" in low
@@ -666,8 +660,6 @@ async def search_amazon_candidates(
     prefer_no_proxy: bool | None = None,
 ) -> tuple[list[dict], bool]:
     """Return organic Amazon results from search page. Second value: proxy_used."""
-    if prefer_no_proxy is None:
-        prefer_no_proxy = not _SERP_USE_PROXY
     if not query:
         return [], False
     if captcha_abort():
@@ -681,31 +673,48 @@ async def search_amazon_candidates(
             return cached, False
 
     async def _run(sess: AsyncSession) -> tuple[list[dict], bool]:
-        proxy_used = False
-        if prefer_no_proxy:
-            candidates = await fetch_serp(
-                sess, query, max_candidates=max_candidates, use_proxy=False
-            )
-            if candidates:
-                if serp_cache is not None:
-                    serp_cache[cache_key] = candidates
-                return candidates, False
-            logger.info(
-                "[SERP] no-proxy empty, retrying with proxy: %s",
-                query[:50],
-            )
+        # Always try direct first (cheaper, often fewer bot walls); proxy when allowed + needed.
+        candidates = await fetch_serp(
+            sess, query, max_candidates=max_candidates, use_proxy=False
+        )
+        if candidates:
+            if serp_cache is not None:
+                serp_cache[cache_key] = candidates
+            return candidates, False
+        if not _SERP_USE_PROXY and prefer_no_proxy is not False:
+            return [], False
+        logger.info(
+            "[SERP] no-proxy empty/blocked, retrying with proxy: %s",
+            query[:50],
+        )
         candidates = await fetch_serp(
             sess, query, max_candidates=max_candidates, use_proxy=True
         )
-        proxy_used = True
         if serp_cache is not None and candidates:
             serp_cache[cache_key] = candidates
-        return candidates, proxy_used
+        return candidates, True
 
     if session is not None:
         return await _run(session)
     async with AsyncSession() as sess:
         return await _run(sess)
+
+
+def _parse_serp_snippet(node) -> str:
+    """Secondary text on SERP cards (often feature/bullet snippets). No extra HTTP."""
+    parts: list[str] = []
+    for sel in (
+        "span.a-color-secondary ::text",
+        "div.a-row.a-size-base.a-color-secondary ::text",
+        ".a-size-base-plus.a-color-secondary ::text",
+        "span.a-truncate-full ::text",
+        ".a-size-base-plus ::text",
+    ):
+        for t in node.css(sel).getall():
+            t = t.strip()
+            if t and len(t) > 3 and t not in parts:
+                parts.append(t)
+    return " ".join(parts)[:600]
 
 
 def _parse_serp_candidates(text: str, max_candidates: int) -> list[dict]:
@@ -747,7 +756,16 @@ def _parse_serp_candidates(text: str, max_candidates: int) -> list[dict]:
         )
         seen.add(asin)
         price = _parse_serp_price(node)
-        candidates.append({"asin": asin, "title": title, "image": image, "price": price})
+        bullets = _parse_serp_snippet(node)
+        candidates.append(
+            {
+                "asin": asin,
+                "title": title,
+                "image": image,
+                "price": price,
+                "bullets": bullets,
+            }
+        )
         if len(candidates) >= max_candidates:
             break
 
@@ -930,7 +948,7 @@ async def _match_listing_inner(
 
     best: dict | None = None
     if ebay_image_url:
-        candidates_for_image = [
+        candidates_for_score = [
             {
                 "asin": c["asin"],
                 "image_url": c.get("image", ""),
@@ -940,24 +958,26 @@ async def _match_listing_inner(
             }
             for c in viable
         ]
-        image_result = await siglip_match(
+        score_result = await score_candidates(
+            ebay_title=title,
             ebay_image_url=ebay_image_url,
-            candidates=candidates_for_image,
+            candidates=candidates_for_score,
             text_best_score=text_best_score,
         )
-        if image_result and image_result["combined_score"] >= 0.72:
-            conf = float(image_result["combined_score"])
-            if image_result["image_score"] >= 0.85:
-                conf = max(conf, 0.81)
-            elif image_result["image_score"] >= 0.75:
-                conf = max(conf, 0.80)
+        if score_result and int(score_result.get("match_score") or 0) >= MATCH_SCORE_THRESHOLD:
+            phash_dist = score_result.get("phash_distance")
+            image_score = (
+                max(0.0, 1.0 - (phash_dist or 9) / 9.0)
+                if phash_dist is not None
+                else None
+            )
             best = {
-                "asin": image_result["asin"],
-                "combined": conf,
-                "content_score": image_result["text_score"],
-                "image_score": image_result["image_score"],
-                "amazon_title": (image_result.get("title") or "").lower(),
-                "method": "image_siglip",
+                "asin": score_result["asin"],
+                "combined": float(score_result["match_confidence"]),
+                "content_score": score_result.get("text_score"),
+                "image_score": image_score,
+                "amazon_title": (score_result.get("title") or "").lower(),
+                "method": score_result.get("match_method") or "score_match",
             }
 
     if best is None:

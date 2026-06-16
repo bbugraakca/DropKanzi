@@ -6,8 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN python -c "from transformers import AutoProcessor, AutoModel; \
-    AutoProcessor.from_pretrained('google/siglip-base-patch16-224'); \
-    AutoModel.from_pretrained('google/siglip-base-patch16-224')"
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('all-MiniLM-L6-v2')"
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]

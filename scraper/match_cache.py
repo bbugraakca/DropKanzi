@@ -8,7 +8,7 @@ import os
 logger = logging.getLogger("pricehawk.match_cache")
 
 _TTL = 7 * 86400  # 7 days — successful matches
-_MISS_TTL = int(os.getenv("FINDER_MISS_CACHE_TTL", "172800"))  # 48h — failed lookups
+_MISS_TTL = int(os.getenv("FINDER_MISS_CACHE_TTL", "21600"))  # 6h — failed lookups
 _client = None
 _checked = False
 
@@ -138,5 +138,37 @@ def set_match(clean_title: str, payload: dict) -> None:
         return
     try:
         r.setex(_key(clean_title), _TTL, json.dumps(payload))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_TITLE_CLEAN_TTL = 7 * 86400
+
+
+def _title_clean_key(clean_title: str) -> str:
+    digest = hashlib.sha256(clean_title.lower().encode()).hexdigest()[:24]
+    return f"pf:tc:{digest}"
+
+
+def get_title_clean(clean_title: str) -> dict | None:
+    r = _redis()
+    if not r or not clean_title:
+        return None
+    try:
+        raw = r.get(_title_clean_key(clean_title))
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_title_clean(clean_title: str, payload: dict) -> None:
+    r = _redis()
+    if not r or not clean_title or not payload:
+        return
+    try:
+        r.setex(_title_clean_key(clean_title), _TITLE_CLEAN_TTL, json.dumps(payload))
     except Exception:  # noqa: BLE001
         pass

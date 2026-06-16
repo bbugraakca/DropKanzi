@@ -30,14 +30,14 @@ from profit_calculator import calculate_batch
 import proxy_meter
 import match_cache
 from amazon_search import reset_captcha_streak, reset_serp_meter, summarize_serp_meter
-from image_match import warmup as siglip_warmup
+from image_match import warmup as match_score_warmup
 
 logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await siglip_warmup()
+    await match_score_warmup()
     yield
 
 
@@ -474,14 +474,27 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
         "match_captcha_aborted": bool(match_stats.get("captcha_aborted")),
         "match_cached_miss": match_stats.get("match_cached_miss", 0),
         "match_raw_before_filter": match_stats.get("match_raw_before_filter", 0),
+        "claude_arbitration_calls": match_stats.get("claude_arbitration_calls", 0),
+        "asin_reuse_rejected": match_stats.get("asin_reuse_rejected", 0),
         "match_methods": {
             "asin_in_title": _count_match_method("asin_in_title", "pre_extracted", "claude_asin_extract"),
             "ebay_detail": _count_match_method("ebay_detail"),
             "mpn_exact": _count_match_method("mpn_exact"),
             "text_search": _count_search_methods(),
-            "image_siglip": _count_match_method("image_siglip"),
+            "score_match": _count_match_method(
+                "score_upc",
+                "score_mpn",
+                "score_phash",
+                "score_brand",
+                "score_title",
+                "score_brand_title",
+                "score_multi",
+                "score_match",
+                "image_siglip",
+            ),
+            "claude_arbitration": _count_match_method("claude_arbitration"),
             "cached_miss": _count_match_method("cached_miss"),
-            "no_match": _count_match_method("no_match", "captcha_abort"),
+            "no_match": _count_match_method("no_match", "captcha_abort", "asin_reuse_rejected"),
         },
         "ebay_seller_id": ebay_ssn,
         "ebay_store_name": store_name,
