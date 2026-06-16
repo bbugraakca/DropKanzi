@@ -29,20 +29,23 @@ def lookup_similar(title: str, min_cosine: float = 0.93) -> dict[str, Any] | Non
     conn = _db()
     if not conn:
         return None
-    vec = embed_texts([title])[0]
-    vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT asin, amazon_title, confidence, is_negative,
-                   1 - (embedding <=> %s::vector) AS cosine
-            FROM match_vector_cache
-            ORDER BY embedding <=> %s::vector
-            LIMIT 3
-            """,
-            (vtxt, vtxt),
-        )
-        rows = cur.fetchall()
+    try:
+        vec = embed_texts([title])[0]
+        vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT asin, amazon_title, confidence, is_negative,
+                       1 - (embedding <=> %s::vector) AS cosine
+                FROM match_vector_cache
+                ORDER BY embedding <=> %s::vector
+                LIMIT 3
+                """,
+                (vtxt, vtxt),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        return None
     for row in rows:
         if row.get("is_negative"):
             continue
@@ -55,29 +58,35 @@ def save_match(title: str, asin: str, amazon_title: str, confidence: float, sour
     conn = _db()
     if not conn:
         return
-    vec = embed_texts([title])[0]
-    vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO match_vector_cache (embedding, asin, amazon_title, confidence, source, is_negative)
-            VALUES (%s::vector, %s, %s, %s, %s, false)
-            """,
-            (vtxt, asin, amazon_title, confidence, source),
-        )
+    try:
+        vec = embed_texts([title])[0]
+        vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO match_vector_cache (embedding, asin, amazon_title, confidence, source, is_negative)
+                VALUES (%s::vector, %s, %s, %s, %s, false)
+                """,
+                (vtxt, asin, amazon_title, confidence, source),
+            )
+    except Exception:
+        return
 
 
 def set_negative(title: str, asin: str) -> None:
     conn = _db()
     if not conn:
         return
-    vec = embed_texts([title])[0]
-    vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO match_vector_cache (embedding, asin, amazon_title, confidence, source, is_negative)
-            VALUES (%s::vector, %s, %s, %s, %s, true)
-            """,
-            (vtxt, asin, json.dumps({"negative": True}), 0.0, "feedback"),
-        )
+    try:
+        vec = embed_texts([title])[0]
+        vtxt = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO match_vector_cache (embedding, asin, amazon_title, confidence, source, is_negative)
+                VALUES (%s::vector, %s, %s, %s, %s, true)
+                """,
+                (vtxt, asin, json.dumps({"negative": True}), 0.0, "feedback"),
+            )
+    except Exception:
+        return

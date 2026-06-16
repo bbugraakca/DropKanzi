@@ -47,8 +47,13 @@ async function apiFetch<T>(
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const detail = (data as { detail?: string }).detail;
-      let base = (data as { error?: string }).error || `Request failed (${res.status})`;
+      const body = data as { error?: string; message?: string; detail?: string };
+      const detail = body.detail;
+      let base =
+        body.error?.trim() ||
+        body.message?.trim() ||
+        (typeof detail === "string" ? detail.trim() : "") ||
+        `Request failed (${res.status})`;
       if (
         res.status === 500 &&
         !base &&

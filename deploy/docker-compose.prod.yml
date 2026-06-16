@@ -58,9 +58,9 @@ services:
       - ../.env
     environment:
       PORT: 3001
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
       SCRAPER_URL: http://scraper:8001
+      # DATABASE_URL + REDIS_URL come from env_file — do not set ${DATABASE_URL} here
+      # (host substitution can be empty and override env_file → crash loop).
     expose:
       - "3001"
     depends_on:
@@ -77,8 +77,6 @@ services:
       - ../.env
     command: ["node", "dist/workers/pfScanWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
       SCRAPER_URL: http://scraper:8001
       PF_SCAN_BUDGET_USD: ${PF_SCAN_BUDGET_USD:-2}
     depends_on:
@@ -93,8 +91,6 @@ services:
       - ../.env
     command: ["node", "dist/workers/pfRepriceWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
       SCRAPER_URL: http://scraper:8001
     depends_on:
       - backend

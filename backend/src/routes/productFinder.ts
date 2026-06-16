@@ -4,6 +4,7 @@ import { isPlausibleAsin } from "../utils/asin";
 import { prisma, currentTenantId } from "../services/db";
 import {
   acceptedListingsForClient,
+  listingsForStorage,
   listingKey,
   allRemoveKeys,
   activeRemoveKeys,
@@ -21,7 +22,6 @@ import {
   listMissingPriceAsins,
   countFoundBySeller,
   applyFoundPricesByAsin,
-  type FoundSortKey,
   dedupeFoundProducts,
 } from "../services/foundList";
 import type { ProfitQueryParams } from "../services/productFinderProfit";
@@ -52,11 +52,11 @@ import {
   clearActiveForSeller,
   clearAllActiveListings,
   applyActivePricesByAsin,
-  type ActiveSortKey,
 } from "../services/activeList";
 import { mergeMatchedIntoFound } from "../services/foundMerge";
 import { requirePfAuth } from "../middleware/auth";
 import { createRedisClient } from "../services/redis";
+import { parseNumericFilter, parseSortColumn } from "../services/sqlFilter";
 
 function parseProfitQuery(req: { query: Record<string, unknown> }): ProfitQueryParams {
   const vatPct = parseFloat(String(req.query.vatRatePercent ?? ""));
@@ -160,15 +160,16 @@ productFinderRouter.post("/analyze", async (req, res) => {
         orderBy: { createdAt: "desc" },
       });
       if (cached && Array.isArray(cached.listings)) {
-        const listings = acceptedListingsForClient(cached.listings as FinderListing[]);
+        const stored = cached.listings as FinderListing[];
+        const accepted = acceptedListingsForClient(stored);
         const summary = summaryWithAcceptedCount(
-          listings,
+          stored,
           cached.summary as Record<string, unknown> | null
         );
-        if (listings.length > 0 || Number(summary.total_listings ?? 0) > 0) {
-          if (listings.length > 0) {
+        if (stored.length > 0 || Number(summary.total_listings ?? 0) > 0) {
+          if (stored.length > 0) {
             try {
-              await mergeMatchedIntoFound(seller, daysBack, listings, {
+              await mergeMatchedIntoFound(seller, daysBack, stored, {
                 replaceWindow: true,
                 tenantId,
               });
@@ -176,11 +177,11 @@ productFinderRouter.post("/analyze", async (req, res) => {
               console.error(`[product-finder] cached Found merge for ${seller}:`, mergeErr);
             }
           }
-          const omitListings = listings.length > 150;
+          const omitListings = stored.length > 150;
           return res.json({
             seller,
             cached: true,
-            listings: omitListings ? [] : listings,
+            listings: omitListings ? [] : stored,
             listings_omitted: omitListings,
             summary: { ...summary, proxy_bytes: 0, proxy_cost_usd: 0 },
           });
@@ -257,15 +258,16 @@ productFinderRouter.post("/analyze", async (req, res) => {
     }
 
     const allListings = Array.isArray(data.listings) ? (data.listings as FinderListing[]) : [];
-    const clientListings = acceptedListingsForClient(allListings);
+    const stored = listingsForStorage(allListings);
+    const accepted = acceptedListingsForClient(allListings);
     const summary = summaryWithAcceptedCount(
-      clientListings,
+      allListings,
       data.summary as Record<string, unknown> | null
     );
 
     let persistWarning: string | undefined;
     const totalSold = Number(summary.total_listings ?? 0);
-    if (totalSold > 0 || clientListings.length > 0) {
+    if (totalSold > 0 || stored.length > 0) {
       try {
         await prisma.sellerAnalysis.deleteMany({
           where: { tenantId, seller, daysBack, scanType: "sold" },
@@ -276,7 +278,7 @@ productFinderRouter.post("/analyze", async (req, res) => {
             seller,
             daysBack,
             scanType: "sold",
-            listings: clientListings as Prisma.InputJsonValue,
+            listings: stored as Prisma.InputJsonValue,
             summary: summary as Prisma.InputJsonValue,
           },
         });
@@ -287,9 +289,9 @@ productFinderRouter.post("/analyze", async (req, res) => {
         persistWarning = msg.slice(0, 200);
       }
 
-      if (clientListings.length > 0) {
+      if (stored.length > 0) {
         try {
-          await mergeMatchedIntoFound(seller, daysBack, clientListings, {
+          await mergeMatchedIntoFound(seller, daysBack, stored, {
             replaceWindow: true,
             tenantId,
           });
@@ -302,10 +304,12 @@ productFinderRouter.post("/analyze", async (req, res) => {
       }
     }
 
+    const omitListings = stored.length > 150;
     return res.json({
       cached: false,
       seller: data.seller || seller,
-      listings: clientListings,
+      listings: omitListings ? [] : stored,
+      listings_omitted: omitListings,
       summary: persistWarning ? { ...summary, persist_warning: persistWarning } : summary,
     });
   } catch (err) {
@@ -388,15 +392,17 @@ productFinderRouter.get("/found", async (req, res) => {
     const missingPrice =
       req.query.missingPrice === "true" || req.query.missingPrice === "1";
     const hasPrice = req.query.hasPrice === "true" || req.query.hasPrice === "1";
-    const minMatchConfidence = parseFloat(String(req.query.minMatchConfidence ?? ""));
-    const minMargin = parseFloat(String(req.query.minMargin ?? ""));
-    const minSoldPrice = parseFloat(String(req.query.minSoldPrice ?? ""));
-    const sortRaw = String(req.query.sort ?? "profit");
-    const sort = (
-      ["profit", "margin", "sold_date", "sold_price", "quantity", "match"] as const
-    ).includes(sortRaw as FoundSortKey)
-      ? (sortRaw as FoundSortKey)
-      : "profit";
+    const minMatchConfidence = parseNumericFilter(req.query.minMatchConfidence, {
+      min: 0,
+      exclusiveMin: true,
+    });
+    const minMargin = parseNumericFilter(req.query.minMargin, { min: 0, exclusiveMin: true });
+    const minSoldPrice = parseNumericFilter(req.query.minSoldPrice, { min: 0, exclusiveMin: true });
+    const sort = parseSortColumn(
+      req.query.sort,
+      ["profit", "margin", "sold_date", "sold_price", "quantity", "match"] as const,
+      "profit"
+    );
 
     const pageQuery = {
       page,
@@ -406,9 +412,9 @@ productFinderRouter.get("/found", async (req, res) => {
       profitable: profitable || undefined,
       missingPrice: missingPrice || undefined,
       hasPrice: hasPrice || undefined,
-      minMatchConfidence: Number.isFinite(minMatchConfidence) ? minMatchConfidence : undefined,
-      minMargin: Number.isFinite(minMargin) ? minMargin : undefined,
-      minSoldPrice: Number.isFinite(minSoldPrice) ? minSoldPrice : undefined,
+      minMatchConfidence,
+      minMargin,
+      minSoldPrice,
       sort,
       ...parseProfitQuery(req),
     };
@@ -417,8 +423,10 @@ productFinderRouter.get("/found", async (req, res) => {
 
     const wantStats =
       req.query.includeStats === "true" || req.query.includeStats === "1";
-    const stats = wantStats
-      ? await getFoundStatsForQuery({
+    let stats;
+    if (wantStats) {
+      try {
+        stats = await getFoundStatsForQuery({
           seller: pageQuery.seller,
           q: pageQuery.q,
           profitable: pageQuery.profitable,
@@ -430,8 +438,11 @@ productFinderRouter.get("/found", async (req, res) => {
           sort: pageQuery.sort,
           vatRate: pageQuery.vatRate,
           additionalFee: pageQuery.additionalFee,
-        })
-      : undefined;
+        });
+      } catch (statsErr) {
+        console.error("[product-finder/found/stats]", statsErr);
+      }
+    }
 
     return res.json({
       listings: result.listings,
@@ -442,6 +453,7 @@ productFinderRouter.get("/found", async (req, res) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Load found failed";
+    console.error("[product-finder/found]", err);
     return res.status(500).json({ error: message });
   }
 });
@@ -1035,7 +1047,7 @@ productFinderRouter.post("/found/import-all", async (_req, res) => {
     let sellers = 0;
     for (const row of analyses) {
       if (!Array.isArray(row.listings)) continue;
-      const listings = acceptedListingsForClient(row.listings as FinderListing[]);
+      const listings = row.listings as FinderListing[];
       if (listings.length === 0) continue;
       await mergeMatchedIntoFound(row.seller, row.daysBack, listings, {
         replaceWindow: true,
@@ -1069,9 +1081,9 @@ productFinderRouter.post("/found/import/:seller/:daysBack", async (req, res) => 
     if (!row || !Array.isArray(row.listings) || row.listings.length === 0) {
       return res.status(404).json({ error: "No saved analysis found" });
     }
-    const listings = acceptedListingsForClient(row.listings as FinderListing[]);
+    const listings = row.listings as FinderListing[];
     if (listings.length === 0) {
-      return res.status(404).json({ error: "No accepted matches in saved analysis" });
+      return res.status(404).json({ error: "No listings in saved analysis" });
     }
     await mergeMatchedIntoFound(seller, daysBack, listings, { replaceWindow: true, tenantId });
     const sellerInFound = await prisma.foundProduct.count({ where: { tenantId, seller } });
@@ -1104,17 +1116,22 @@ productFinderRouter.get("/history/:seller/:daysBack", async (req, res) => {
       orderBy: { createdAt: "desc" },
     });
     if (!row || !Array.isArray(row.listings) || row.listings.length === 0) {
-      return res.status(404).json({ error: "No saved analysis found" });
+      const total = Number((row?.summary as Record<string, unknown> | null)?.total_listings ?? 0);
+      if (!row || total <= 0) {
+        return res.status(404).json({ error: "No saved analysis found" });
+      }
     }
-    const listings = acceptedListingsForClient(row.listings as FinderListing[]);
+    const stored = (row!.listings as FinderListing[]) ?? [];
     const summary = summaryWithAcceptedCount(
-      listings,
-      row.summary as Record<string, unknown> | null
+      stored,
+      row!.summary as Record<string, unknown> | null
     );
+    const omitListings = stored.length > 150;
     return res.json({
-      seller: row.seller,
+      seller: row!.seller,
       cached: true,
-      listings,
+      listings: omitListings ? [] : stored,
+      listings_omitted: omitListings,
       summary,
     });
   } catch (err) {
@@ -1151,22 +1168,23 @@ productFinderRouter.post("/analyze-active", async (req, res) => {
         orderBy: { createdAt: "desc" },
       });
       if (cached && Array.isArray(cached.listings)) {
-        const listings = acceptedListingsForClient(cached.listings as FinderListing[]);
+        const stored = cached.listings as FinderListing[];
+        const accepted = acceptedListingsForClient(stored);
         const summary = summaryWithAcceptedCount(
-          listings,
+          stored,
           cached.summary as Record<string, unknown> | null
         );
-        if (listings.length > 0 || Number(summary.total_listings ?? 0) > 0) {
+        if (stored.length > 0 || Number(summary.total_listings ?? 0) > 0) {
           try {
-            await mergeActiveListings(seller, listings, { replaceSeller: true, tenantId });
+            await mergeActiveListings(seller, accepted, { replaceSeller: true, tenantId });
           } catch (mergeErr) {
             console.error(`[product-finder] cached Active merge for ${seller}:`, mergeErr);
           }
-          const omitListings = listings.length > 150;
+          const omitListings = stored.length > 150;
           return res.json({
             seller,
             cached: true,
-            listings: omitListings ? [] : listings,
+            listings: omitListings ? [] : stored,
             listings_omitted: omitListings,
             summary: { ...summary, proxy_bytes: 0, proxy_cost_usd: 0 },
           });
@@ -1226,9 +1244,10 @@ productFinderRouter.post("/analyze-active", async (req, res) => {
     }
 
     const allListings = Array.isArray(data.listings) ? (data.listings as FinderListing[]) : [];
-    const clientListings = acceptedListingsForClient(allListings);
+    const stored = listingsForStorage(allListings);
+    const accepted = acceptedListingsForClient(allListings);
     const summary = summaryWithAcceptedCount(
-      clientListings,
+      allListings,
       data.summary as Record<string, unknown> | null
     );
 
@@ -1242,7 +1261,7 @@ productFinderRouter.post("/analyze-active", async (req, res) => {
           seller,
           daysBack: 0,
           scanType: "active",
-          listings: clientListings as Prisma.InputJsonValue,
+          listings: stored as Prisma.InputJsonValue,
           summary: summary as Prisma.InputJsonValue,
         },
       });
@@ -1251,16 +1270,16 @@ productFinderRouter.post("/analyze-active", async (req, res) => {
     }
 
     try {
-      await mergeActiveListings(seller, clientListings, { replaceSeller: true, tenantId });
+      await mergeActiveListings(seller, accepted, { replaceSeller: true, tenantId });
     } catch (mergeErr) {
       console.error(`[product-finder] Active merge for ${seller}:`, mergeErr);
     }
 
-    const omitListings = clientListings.length > 150;
+    const omitListings = stored.length > 150;
     return res.json({
       seller,
       cached: false,
-      listings: omitListings ? [] : clientListings,
+      listings: omitListings ? [] : stored,
       listings_omitted: omitListings,
       summary,
     });
@@ -1280,14 +1299,14 @@ productFinderRouter.post("/analyze-active", async (req, res) => {
 productFinderRouter.get("/active", async (req, res) => {
   try {
     const pq = parseProfitQuery(req);
-    const sortRaw = String(req.query.sort ?? "profit");
-    const sort: ActiveSortKey =
-      sortRaw === "margin" || sortRaw === "sold_price" || sortRaw === "match"
-        ? sortRaw
-        : "profit";
-    const minConf = parseFloat(String(req.query.minMatchConfidence ?? ""));
-    const minMargin = parseFloat(String(req.query.minMargin ?? ""));
-    const minListPrice = parseFloat(String(req.query.minListPrice ?? ""));
+    const sort = parseSortColumn(
+      req.query.sort,
+      ["profit", "margin", "sold_price", "match"] as const,
+      "profit"
+    );
+    const minConf = parseNumericFilter(req.query.minMatchConfidence, { min: 0, exclusiveMin: true });
+    const minMargin = parseNumericFilter(req.query.minMargin, { min: 0, exclusiveMin: true });
+    const minListPrice = parseNumericFilter(req.query.minListPrice, { min: 0, exclusiveMin: true });
 
     const result = await listActivePage({
       page: parseInt(String(req.query.page ?? "1"), 10),
@@ -1297,9 +1316,9 @@ productFinderRouter.get("/active", async (req, res) => {
       profitable: req.query.profitable === "true" || req.query.profitable === "1",
       missingPrice: req.query.missingPrice === "true" || req.query.missingPrice === "1",
       hasPrice: req.query.hasPrice === "true" || req.query.hasPrice === "1",
-      minMatchConfidence: Number.isFinite(minConf) ? minConf : undefined,
-      minMargin: Number.isFinite(minMargin) ? minMargin : undefined,
-      minListPrice: Number.isFinite(minListPrice) ? minListPrice : undefined,
+      minMatchConfidence: minConf,
+      minMargin,
+      minListPrice,
       sort,
       vatRate: pq.vatRate,
       additionalFee: pq.additionalFee,

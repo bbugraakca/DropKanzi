@@ -1,4 +1,5 @@
 import { prisma, currentTenantId } from "./db";
+import { parseNumericFilter, parseSortColumn } from "./sqlFilter";
 import { sqlTenantWhere } from "./sqlUtils";
 import { mergeListing, activeListingKey, type FinderListing } from "./foundProducts";
 import { Prisma } from "@prisma/client";
@@ -43,10 +44,10 @@ function profitParams(query: ActivePageQuery): ProfitQueryParams {
 }
 
 const SORT_SQL: Record<ActiveSortKey, string> = {
-  profit: `(payload->>'net_profit')::double precision DESC NULLS LAST`,
-  margin: `(payload->>'margin_percent')::double precision DESC NULLS LAST`,
-  sold_price: `(payload->>'sold_price')::double precision DESC NULLS LAST`,
-  match: `(payload->>'match_confidence')::double precision DESC NULLS LAST`,
+  profit: `NULLIF(payload->>'net_profit', '')::double precision DESC NULLS LAST`,
+  margin: `NULLIF(payload->>'margin_percent', '')::double precision DESC NULLS LAST`,
+  sold_price: `NULLIF(payload->>'sold_price', '')::double precision DESC NULLS LAST`,
+  match: `NULLIF(payload->>'match_confidence', '')::double precision DESC NULLS LAST`,
 };
 
 function buildWhere(query: ActivePageQuery, paramStart = 1): { sql: string; params: unknown[] } {
@@ -83,22 +84,29 @@ function buildWhere(query: ActivePageQuery, paramStart = 1): { sql: string; para
     parts.push(MISSING_PRICE_SQL);
   }
   if (query.minMatchConfidence != null && query.minMatchConfidence > 0) {
-    const match = minMatchConfidenceWhereSql(query.minMatchConfidence, i);
-    parts.push(match.sql);
-    params.push(...match.params);
-    i += match.params.length;
+    const conf = parseNumericFilter(query.minMatchConfidence, { min: 0, exclusiveMin: true });
+    if (conf !== undefined) {
+      const match = minMatchConfidenceWhereSql(conf, i);
+      parts.push(match.sql);
+      params.push(...match.params);
+      i += match.params.length;
+    }
   }
   if (query.minMargin != null && query.minMargin > 0) {
-    const margin = minMarginWhereSql(query.minMargin, profitParams(query), i);
-    parts.push(margin.sql);
-    params.push(...margin.params);
-    i += margin.params.length;
+    const marginVal = parseNumericFilter(query.minMargin, { min: 0, exclusiveMin: true });
+    if (marginVal !== undefined) {
+      const margin = minMarginWhereSql(marginVal, profitParams(query), i);
+      parts.push(margin.sql);
+      params.push(...margin.params);
+      i += margin.params.length;
+    }
   }
-  if (query.minListPrice != null && query.minListPrice > 0) {
+  const minList = parseNumericFilter(query.minListPrice, { min: 0, exclusiveMin: true });
+  if (minList !== undefined) {
     parts.push(
       `(NULLIF(payload->>'sold_price', '')::double precision) >= $${i}::double precision`
     );
-    params.push(Number(query.minListPrice));
+    params.push(minList);
     i++;
   }
 
@@ -117,7 +125,11 @@ export async function listActivePage(query: ActivePageQuery): Promise<{
   const tenantId = currentTenantId();
   const { sql: whereSql, params } = buildWhere(query);
   const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
-  const sortKey = query.sort && SORT_SQL[query.sort] ? query.sort : "profit";
+  const sortKey = parseSortColumn(
+    query.sort,
+    Object.keys(SORT_SQL) as ActiveSortKey[],
+    "profit"
+  );
   const orderSql = SORT_SQL[sortKey];
 
   const countRows = await prisma.$queryRawUnsafe<{ c: bigint }[]>(

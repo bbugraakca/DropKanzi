@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type IORedis from "ioredis";
-import { cancelPfScan, createPfScanJob, getPfScanJobById, listPfScanJobs } from "../services/pfScanJob";
+import { cancelPfScan, createPfScanJob, getPfScanJobById, listPfScanJobs, removePfScanJob } from "../services/pfScanJob";
 import { tenantFromRequest } from "../services/tenant";
 import { requirePfAuth } from "../middleware/auth";
 import { createRedisSubscriber, subscribeWhenReady } from "../services/redis";
@@ -31,6 +31,7 @@ pfScanRouter.post("/", async (req, res) => {
     });
     return res.json(out);
   } catch (err) {
+    console.error("[pf-scan POST]", err);
     const message = err instanceof Error ? err.message : "enqueue failed";
     return res.status(500).json({ error: message });
   }
@@ -57,14 +58,23 @@ pfScanRouter.post("/:id/cancel", async (req, res) => {
   }
 });
 
+pfScanRouter.delete("/:id", async (req, res) => {
+  try {
+    const out = await removePfScanJob(String(req.params.id));
+    if (!out.removed) return res.status(404).json({ error: "job not found" });
+    return res.json(out);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "delete failed";
+    return res.status(500).json({ error: message });
+  }
+});
+
 pfScanRouter.get("/stream", async (req, res) => {
   const tenantId = tenantFromRequest(req);
   const jobId = String(req.query.jobId ?? "").trim();
   if (!jobId) {
     return res.status(400).json({ error: "jobId query param is required" });
   }
-  const row = await getPfScanJobById(jobId);
-  if (!row) return res.status(404).json({ error: "job not found" });
 
   let redis: IORedis | null = null;
   const channel = `pf:progress:${jobId}`;
@@ -76,6 +86,9 @@ pfScanRouter.get("/stream", async (req, res) => {
   };
 
   try {
+    const row = await getPfScanJobById(jobId);
+    if (!row) return res.status(404).json({ error: "job not found" });
+
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -105,10 +118,13 @@ pfScanRouter.get("/stream", async (req, res) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[pf-scan-stream:${jobId}] subscribe failed: ${message}`);
+    console.warn(`[pf-scan-stream:${jobId}] failed: ${message}`);
     void redis?.quit().catch(() => undefined);
     if (!res.headersSent) {
-      return res.status(503).json({ error: "Redis unavailable for progress stream" });
+      const isRedis = /redis|subscribe|writeable/i.test(message);
+      return res.status(isRedis ? 503 : 500).json({
+        error: isRedis ? "Redis unavailable for progress stream" : message,
+      });
     }
     send("error", { error: "Redis unavailable", detail: message });
     res.end();

@@ -28,6 +28,6 @@ def get_datacenter_proxy_url() -> str | None:
     password = os.getenv("DC_PROXY_PASS") or os.getenv("PROXY_PASS")
     if not user or not password:
         return None
-    host = os.getenv("DC_PROXY_HOST", DEFAULT_DC_HOST)
-    port = os.getenv("DC_PROXY_PORT", DEFAULT_DC_PORT)
+    host = os.getenv("DC_PROXY_HOST") or os.getenv("PROXY_HOST") or DEFAULT_HOST
+    port = os.getenv("DC_PROXY_PORT") or os.getenv("PROXY_PORT") or DEFAULT_PORT
     return f"http://{user}:{password}@{host}:{port}"

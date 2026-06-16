@@ -16,3 +16,8 @@ export function withTenantContext<T>(tenantId: string, fn: () => Promise<T>): Pr
 export function currentTenantId(): string {
   return tenantStorage.getStore()?.tenantId || DEFAULT_TENANT_ID;
 }
+
+export function runWithTenantSync(tenantId: string, fn: () => void): void {
+  const normalized = tenantId?.trim() || DEFAULT_TENANT_ID;
+  tenantStorage.run({ tenantId: normalized }, fn);
+}

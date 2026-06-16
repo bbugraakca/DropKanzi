@@ -531,8 +531,9 @@ async def _product_finder_analyze_inner(req: ProductFinderRequest):
         },
     )
 
-    # Only return accepted matches — sending 5000+ raw eBay rows blows up JSON (~200MB) and causes HTTP 500.
-    return {"seller": seller, "listings": matched, "summary": summary}
+    # Slim all rows for persistence/history (~300B each vs multi-KB raw dicts).
+    slim = [_slim_finder_listing(l) for l in listings]
+    return {"seller": seller, "listings": slim, "summary": summary}
 
 
 async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
@@ -776,7 +777,48 @@ async def _product_finder_analyze_active_inner(req: ProductFinderActiveRequest):
             "summary": summary,
         },
     )
-    return {"seller": seller, "listings": matched, "summary": summary}
+    slim = [_slim_finder_listing(l) for l in listings]
+    return {"seller": seller, "listings": slim, "summary": summary}
+
+
+def _slim_finder_listing(l: dict) -> dict:
+    keys = (
+        "listing_id",
+        "title",
+        "sold_price",
+        "quantity_sold",
+        "sold_date",
+        "url",
+        "image",
+        "amazon_asin",
+        "amazon_price",
+        "match_confidence",
+        "net_profit",
+        "margin_percent",
+        "is_profitable",
+        "amazon_url",
+        "amazon_stock",
+        "match_method",
+        "match_title_score",
+        "match_image_score",
+        "roi_percent",
+        "revenue",
+        "ebay_fee",
+        "payment_fee",
+        "amazon_cost",
+    )
+    out = {k: l[k] for k in keys if k in l and l[k] is not None}
+    if "title" not in out:
+        out["title"] = str(l.get("title") or "")
+    if "url" not in out:
+        out["url"] = str(l.get("url") or "")
+    if "image" not in out:
+        out["image"] = str(l.get("image") or "")
+    if "quantity_sold" not in out:
+        out["quantity_sold"] = int(l.get("quantity_sold") or 1)
+    if "is_profitable" not in out:
+        out["is_profitable"] = bool(l.get("is_profitable"))
+    return out
 
 
 def _empty_summary() -> dict:

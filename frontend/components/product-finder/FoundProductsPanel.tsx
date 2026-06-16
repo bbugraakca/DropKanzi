@@ -216,8 +216,7 @@ export function FoundProductsPanel({
     (): FoundPageParams => ({
       page: 1,
       limit: pageSize,
-      sort: "profit",
-      minMatchConfidence: MIN_MATCH_CONFIDENCE,
+      sort: "sold_date",
       ...profitQueryFromSettings(storeSettings),
     }),
     [pageSize, storeSettings]
@@ -276,8 +275,7 @@ export function FoundProductsPanel({
       seller: focusSeller,
       page: 1,
       limit: pageSize,
-      sort: queryRef.current.sort ?? "profit",
-      minMatchConfidence: MIN_MATCH_CONFIDENCE,
+      sort: queryRef.current.sort ?? "sold_date",
       ...profitQueryFromSettings(storeSettings),
     };
     void loadPage(queryRef.current, { withStats: true });

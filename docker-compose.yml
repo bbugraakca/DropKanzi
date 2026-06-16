@@ -50,8 +50,8 @@ services:
         ]
       interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 90s
+      retries: 8
+      start_period: 180s
 
   backend:
     build:
@@ -62,14 +62,13 @@ services:
       - .env
     environment:
       PORT: ${BACKEND_PORT:-3001}
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      SCRAPER_URL: ${SCRAPER_URL:-http://scraper:8001}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       EBAY_CLIENT_ID: ${EBAY_CLIENT_ID:-}
       EBAY_CLIENT_SECRET: ${EBAY_CLIENT_SECRET:-}
       EBAY_REDIRECT_URI: ${EBAY_REDIRECT_URI:-}
       EBAY_SANDBOX: ${EBAY_SANDBOX:-false}
+      # DATABASE_URL + REDIS_URL from env_file only (see deploy note above).
     ports:
       - "3001:3001"
     depends_on:
@@ -89,9 +88,7 @@ services:
       - .env
     command: ["node", "dist/workers/scrapeWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      SCRAPER_URL: ${SCRAPER_URL:-http://scraper:8001}
       BULK_CONCURRENCY: ${BULK_CONCURRENCY:-40}
       BULK_CHUNK_SIZE: ${BULK_CHUNK_SIZE:-100}
       BULK_PARALLEL_CHUNKS: ${BULK_PARALLEL_CHUNKS:-2}
@@ -116,9 +113,7 @@ services:
       - .env
     command: ["node", "dist/workers/pfScanWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      SCRAPER_URL: ${SCRAPER_URL:-http://scraper:8001}
       PF_SCAN_BUDGET_USD: ${PF_SCAN_BUDGET_USD:-2}
     depends_on:
       postgres:
@@ -139,9 +134,7 @@ services:
       - .env
     command: ["node", "dist/workers/pfRepriceWorker.js"]
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      SCRAPER_URL: ${SCRAPER_URL}
+      SCRAPER_URL: ${SCRAPER_URL:-http://scraper:8001}
     depends_on:
       postgres:
         condition: service_healthy

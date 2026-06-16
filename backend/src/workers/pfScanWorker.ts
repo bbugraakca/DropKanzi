@@ -3,7 +3,13 @@ import { UnrecoverableError, Worker } from "bullmq";
 import { connection } from "../services/queue";
 import { prisma, withTenantContext } from "../services/db";
 import { updatePfScanJob } from "../services/pfScanJob";
-import { acceptedListingsForClient, summaryWithAcceptedCount, type FinderListing } from "../services/foundProducts";
+import { clearCancel } from "../services/pfScanProgress";
+import {
+  acceptedListingsForClient,
+  listingsForStorage,
+  summaryWithAcceptedCount,
+  type FinderListing,
+} from "../services/foundProducts";
 import { mergeActiveListings } from "../services/activeList";
 import { mergeMatchedIntoFound } from "../services/foundMerge";
 
@@ -49,6 +55,7 @@ const worker = new Worker(
         result?: Prisma.InputJsonValue | null;
       }) => updatePfScanJob(job.id!, patch);
 
+      await clearCancel(job.id!);
       await setJob({ status: "active", stage: "ebay_scrape" });
 
       const endpoint =
@@ -73,9 +80,10 @@ const worker = new Worker(
 
       const res = await fetchScraper(endpoint, body);
       const rawListings = Array.isArray(res.listings) ? res.listings : [];
-      const listings = acceptedListingsForClient(rawListings);
+      const accepted = acceptedListingsForClient(rawListings);
+      const stored = listingsForStorage(rawListings);
       const summary = summaryWithAcceptedCount(
-        listings,
+        rawListings,
         res.summary as Record<string, unknown> | null
       );
       const proxyCost = Number(summary.proxy_cost_usd ?? 0);
@@ -111,11 +119,11 @@ const worker = new Worker(
             seller: data.seller,
             daysBack: 0,
             scanType: "active",
-            listings: listings as unknown as Prisma.InputJsonValue,
+            listings: stored as unknown as Prisma.InputJsonValue,
             summary: summary as Prisma.InputJsonValue,
           },
         });
-        await mergeActiveListings(data.seller, listings, {
+        await mergeActiveListings(data.seller, accepted, {
           replaceSeller: true,
           tenantId: data.tenantId,
         });
@@ -134,11 +142,11 @@ const worker = new Worker(
             seller: data.seller,
             daysBack: data.daysBack,
             scanType: "sold",
-            listings: listings as unknown as Prisma.InputJsonValue,
+            listings: stored as unknown as Prisma.InputJsonValue,
             summary: summary as Prisma.InputJsonValue,
           },
         });
-        await mergeMatchedIntoFound(data.seller, data.daysBack, listings, {
+        await mergeMatchedIntoFound(data.seller, data.daysBack, stored, {
           replaceWindow: true,
           tenantId: data.tenantId,
         });
@@ -157,7 +165,7 @@ const worker = new Worker(
       return { ok: true };
     });
   },
-  { connection, concurrency: 2, lockDuration: 60_000 }
+  { connection, concurrency: 2, lockDuration: 1_800_000, maxStalledCount: 2 }
 );
 
 worker.on("failed", async (job, err) => {

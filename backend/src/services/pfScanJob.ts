@@ -1,7 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { enqueuePfScanJob, getPfScanQueue } from "./queue";
 import { prisma, currentTenantId } from "./db";
-import { publishCancel } from "./pfScanProgress";
+import { publishCancel, clearCancel } from "./pfScanProgress";
 
 export type PfScanType = "sold" | "active";
 
@@ -14,8 +14,34 @@ export type CreatePfScanInput = {
   storeSettings?: Record<string, unknown>;
 };
 
+function slugJobIdPart(value: string): string {
+  return (
+    String(value)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "unknown"
+  );
+}
+
 export function buildPfScanJobId(input: CreatePfScanInput, tenantId = currentTenantId()): string {
-  return `${input.scanType}:${tenantId}:${input.seller}:${input.daysBack}:${input.forceRefresh ? "fresh" : "cache"}`;
+  const scanType = slugJobIdPart(input.scanType);
+  const tenant = slugJobIdPart(tenantId);
+  const seller = slugJobIdPart(input.seller);
+  const daysBack = Number.isFinite(input.daysBack) ? Math.round(input.daysBack) : 30;
+  const refresh = input.forceRefresh ? "fresh" : "cache";
+  return `${scanType}-${tenant}-${seller}-${daysBack}-${refresh}`;
+}
+
+async function clearStalePfScanQueueJob(jobId: string): Promise<"busy" | "cleared" | "missing"> {
+  const job = await getPfScanQueue().getJob(jobId);
+  if (!job) return "missing";
+  const state = await job.getState();
+  if (state === "active" || state === "waiting" || state === "delayed") {
+    return "busy";
+  }
+  await job.remove();
+  return "cleared";
 }
 
 export async function createPfScanJob(input: CreatePfScanInput): Promise<{ jobId: string; created: boolean }> {
@@ -23,6 +49,11 @@ export async function createPfScanJob(input: CreatePfScanInput): Promise<{ jobId
   const jobId = buildPfScanJobId(input, tenantId);
   const existing = await prisma.pfScanJob.findUnique({ where: { id: jobId } });
   if (existing && (existing.status === "queued" || existing.status === "active")) {
+    return { jobId, created: false };
+  }
+
+  const queueSlot = await clearStalePfScanQueueJob(jobId);
+  if (queueSlot === "busy") {
     return { jobId, created: false };
   }
 
@@ -51,15 +82,35 @@ export async function createPfScanJob(input: CreatePfScanInput): Promise<{ jobId
     },
   });
 
-  await enqueuePfScanJob(jobId, {
-    tenantId,
-    seller: input.seller,
-    scanType: input.scanType,
-    daysBack: input.daysBack,
-    forceRefresh: input.forceRefresh,
-    fetchPrices: input.fetchPrices !== false,
-    storeSettings: input.storeSettings ?? {},
-  });
+  await clearCancel(jobId);
+
+  try {
+    await enqueuePfScanJob(jobId, {
+      tenantId,
+      seller: input.seller,
+      scanType: input.scanType,
+      daysBack: input.daysBack,
+      forceRefresh: input.forceRefresh,
+      fetchPrices: input.fetchPrices !== false,
+      storeSettings: input.storeSettings ?? {},
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/already exists/i.test(msg)) {
+      await clearStalePfScanQueueJob(jobId);
+      await enqueuePfScanJob(jobId, {
+        tenantId,
+        seller: input.seller,
+        scanType: input.scanType,
+        daysBack: input.daysBack,
+        forceRefresh: input.forceRefresh,
+        fetchPrices: input.fetchPrices !== false,
+        storeSettings: input.storeSettings ?? {},
+      });
+    } else {
+      throw err;
+    }
+  }
   return { jobId, created: true };
 }
 
@@ -121,4 +172,50 @@ export async function cancelPfScan(jobId: string): Promise<{ cancelled: boolean;
   });
   await publishCancel(jobId);
   return { cancelled: true, status: "canceled" };
+}
+
+/** Remove job from BullMQ (if idle) and delete DB row — for completed/canceled queue cleanup. */
+export async function removePfScanJob(jobId: string): Promise<{ removed: boolean }> {
+  const row = await prisma.pfScanJob.findUnique({ where: { id: jobId } });
+  if (!row) return { removed: false };
+
+  if (row.status === "active" || row.status === "queued") {
+    await cancelPfScan(jobId);
+  }
+
+  const job = await getPfScanQueue().getJob(jobId);
+  if (job) {
+    const state = await job.getState();
+    if (state !== "active") {
+      await job.remove();
+    }
+  }
+
+  await prisma.pfScanJob.delete({ where: { id: jobId } });
+  return { removed: true };
+}
+
+/** Delete all scan jobs for a seller (e.g. smoke-test cleanup). */
+export async function removePfScanJobsBySeller(seller: string): Promise<number> {
+  const tenantId = currentTenantId();
+  const needle = seller.trim().toLowerCase();
+  if (!needle) return 0;
+
+  const rows = await prisma.pfScanJob.findMany({
+    where: {
+      tenantId,
+      OR: [
+        { seller: { equals: seller, mode: "insensitive" } },
+        { id: { contains: slugJobIdPart(seller), mode: "insensitive" } },
+      ],
+    },
+    select: { id: true },
+  });
+
+  let removed = 0;
+  for (const row of rows) {
+    const out = await removePfScanJob(row.id);
+    if (out.removed) removed += 1;
+  }
+  return removed;
 }

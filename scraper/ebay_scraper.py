@@ -188,8 +188,8 @@ async def _ebay_get_force_proxy(session: AsyncSession, url: str, **kwargs):
 
 
 def _proxies() -> dict | None:
-    """Route eBay through datacenter proxy by default."""
-    return ensure_proxy("datacenter")
+    """eBay sold search — residential gateway only (dc.* often fails DNS in Docker)."""
+    return ensure_proxy("residential")
 
 
 def _html_looks_blocked(html: str) -> bool:
@@ -356,8 +356,12 @@ async def _ebay_get(session: AsyncSession, url: str, **kwargs):
     try:
         if EBAY_PROXY_MODE == "always":
             r = await session.get(url, proxies=_proxies(), **kwargs)
-            proxy_meter.add_response(r)
-            return r
+            if r is not None and r.status_code == 200 and not _is_challenged(r):
+                proxy_meter.add_response(r)
+                return r
+            logger.warning("eBay proxy/challenge on %s — retrying direct", url[:96])
+            direct = await session.get(url, proxies=None, **kwargs)
+            return direct
         if EBAY_PROXY_MODE == "never":
             return await session.get(url, proxies=None, **kwargs)
         r = await session.get(url, proxies=None, **kwargs)
@@ -367,6 +371,11 @@ async def _ebay_get(session: AsyncSession, url: str, **kwargs):
         return r2 if r2 is not None else r
     except Exception as exc:  # noqa: BLE001
         logger.warning("eBay GET failed %s: %s", url[:96], exc)
+        if EBAY_PROXY_MODE == "always":
+            try:
+                return await session.get(url, proxies=None, **kwargs)
+            except Exception as direct_exc:  # noqa: BLE001
+                logger.warning("eBay direct fallback failed %s: %s", url[:96], direct_exc)
         return None
 
 
@@ -674,7 +683,22 @@ async def _scrape_seller_sold_listings_inner(
     store_name: str | None = None,
 ) -> list[dict]:
     """Inner scrape loop (must run under _EBAY_GATE)."""
+
+    def _sold_line_key(it: dict) -> str:
+        sold = (
+            f"{str(it.get('sold_date') or '')[:10]}|"
+            f"{it.get('sold_price')}|{it.get('quantity_sold') or 1}"
+        )
+        lid = it.get("listing_id")
+        if lid:
+            return f"lid:{lid}|{sold}"
+        url = str(it.get("url") or "").split("?")[0]
+        if url:
+            return f"url:{url}|{sold}"
+        return f"title:{it.get('title')}|{sold}"
+
     all_items: list[dict] = []
+    seen_keys: set[str] = set()
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
     empty_window_pages = 0
 
@@ -714,7 +738,18 @@ async def _scrape_seller_sold_listings_inner(
                 if it["sold_date"] is None
                 or datetime.fromisoformat(it["sold_date"]) >= cutoff_date
             ]
-            all_items.extend(in_window)
+            new_items: list[dict] = []
+            for it in in_window:
+                key = _sold_line_key(it)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                new_items.append(it)
+            all_items.extend(new_items)
+
+            # Pagination stuck (challenge/cookie) — same rows repeat every page.
+            if page > 1 and len(new_items) == 0:
+                break
 
             if len(all_items) >= max_items:
                 break

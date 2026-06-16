@@ -60,6 +60,7 @@ import {
   writeReservedLocal,
   scheduleWriteReservedLocal,
   archiveSellerScan,
+  syncWatchlistFromDoneJobs,
   rememberSellerSearches,
   uniqueSellerHistory,
   WEEKLY_REFRESH_DAYS,
@@ -164,6 +165,7 @@ export default function ProductFinderPage() {
 
   const [queueView, setQueueView] = useState<QueueItem[]>([]);
   const queueMapRef = useRef<Map<string, QueueItem>>(new Map());
+  const archivedJobIdsRef = useRef<Set<string>>(new Set());
   const [foundTotal, setFoundTotal] = useState(0);
   const [foundRefreshKey, setFoundRefreshKey] = useState(0);
   const [activeTotal, setActiveTotal] = useState(0);
@@ -411,26 +413,74 @@ export default function ProductFinderPage() {
         const existing = queueMapRef.current.get(j.id);
         const summary = ((j.progress as { summary?: Record<string, unknown> } | null)?.summary ??
           {}) as Record<string, unknown>;
+        const result = (j.result ?? {}) as {
+          total?: number;
+          matched?: number;
+          proxyCostUsd?: number;
+        };
+        const totalListings = Number(
+          summary.total_listings ?? result.total ?? existing?.total ?? 0
+        );
+        const ebayMsg =
+          typeof summary.ebay_message === "string" ? summary.ebay_message.trim() : "";
+        const isCanceled = j.status === "canceled";
+        let status: QueueItem["status"] =
+          j.status === "active"
+            ? "running"
+            : j.status === "queued"
+              ? "queued"
+              : j.status === "done"
+                ? "done"
+                : isCanceled
+                  ? "failed"
+                  : "failed";
+        let error: string | undefined = j.error ?? undefined;
+        if (j.status === "done" && totalListings === 0 && ebayMsg) {
+          status = "failed";
+          error = ebayMsg;
+        }
+        const proxyStages = summary.proxy_stages as QueueItem["costStages"];
         const item: QueueItem = {
           id: j.id,
           seller: j.seller,
           daysBack: j.daysBack,
           scanMode: j.scanType as "sold" | "active",
-          status:
-            j.status === "active"
-              ? "running"
-              : j.status === "queued"
-                ? "queued"
-                : j.status === "done"
-                  ? "done"
-                  : "failed",
-          matched: Number(summary.matched_to_amazon ?? existing?.matched ?? 0),
-          total: Number(summary.total_listings ?? existing?.total ?? 0),
-          costUsd: Number(summary.proxy_cost_usd ?? existing?.costUsd ?? 0),
-          error: j.error ?? undefined,
+          status,
+          matched: Number(summary.matched_to_amazon ?? result.matched ?? existing?.matched ?? 0),
+          total: totalListings,
+          costUsd: Number(summary.proxy_cost_usd ?? result.proxyCostUsd ?? existing?.costUsd ?? 0),
+          costBytes: Number(summary.proxy_bytes ?? existing?.costBytes ?? 0),
+          costRequests: Number(summary.proxy_requests ?? existing?.costRequests ?? 0),
+          costStages: proxyStages ?? existing?.costStages,
+          matchAttempted: Number(summary.match_groups_attempted ?? existing?.matchAttempted ?? 0),
+          matchSkipped: Number(summary.match_groups_skipped ?? existing?.matchSkipped ?? 0),
+          ebaySellerId:
+            typeof summary.ebay_seller_id === "string"
+              ? summary.ebay_seller_id
+              : existing?.ebaySellerId,
+          ebayMessage: ebayMsg || existing?.ebayMessage,
+          error,
           forceRefresh: j.forceRefresh || undefined,
         };
         queueMapRef.current.set(j.id, item);
+        if (
+          (j.status === "done" || j.status === "failed" || j.status === "canceled") &&
+          !archivedJobIdsRef.current.has(j.id)
+        ) {
+          archivedJobIdsRef.current.add(j.id);
+          if (isCanceled) {
+            queueMapRef.current.delete(j.id);
+          } else if (item.status === "done" || item.status === "failed") {
+            archiveAndRemoveQueueItem(item);
+            if (item.scanMode === "active") bumpActive();
+            else bumpFound();
+          } else {
+            queueMapRef.current.delete(j.id);
+          }
+        }
+      }
+      if (syncWatchlistFromDoneJobs(jobs)) {
+        setPastSellersRefresh((n) => n + 1);
       }
       syncQueue();
     };
@@ -442,7 +492,7 @@ export default function ProductFinderPage() {
       stop = true;
       window.clearInterval(poll);
     };
-  }, [syncQueue]);
+  }, [syncQueue, archiveAndRemoveQueueItem, bumpActive, bumpFound]);
 
   const deletedFoundRef = useRef(readDeletedFoundKeys());
 
@@ -1170,7 +1220,11 @@ export default function ProductFinderPage() {
             forceRefresh: job.forceRefresh || undefined,
           };
           queueMapRef.current.set(job.id, next);
-          if (next.status === "done" || next.status === "failed") {
+          if (statusRaw === "canceled") {
+            queueMapRef.current.delete(job.id);
+            streams.get(job.id)?.close();
+            streams.delete(job.id);
+          } else if (next.status === "done" || next.status === "failed") {
             archiveAndRemoveQueueItem(next);
             if (next.scanMode === "active") bumpActive();
             else bumpFound();
