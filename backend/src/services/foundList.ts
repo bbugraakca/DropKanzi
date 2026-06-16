@@ -1,4 +1,5 @@
 import { prisma, currentTenantId } from "./db";
+import { sqlTenantWhere } from "./sqlUtils";
 import { mergeListing, dedupeGroupKey, isBetterListing, type FinderListing } from "./foundProducts";
 import { Prisma } from "@prisma/client";
 import { isPlausibleAsin } from "../utils/asin";
@@ -53,7 +54,7 @@ const SORT_SQL: Record<FoundSortKey, string> = {
   match: `(payload->>'match_confidence')::double precision DESC NULLS LAST`,
 };
 
-function buildWhere(query: FoundPageQuery, paramStart = 2): { sql: string; params: unknown[] } {
+function buildWhere(query: FoundPageQuery, paramStart = 1): { sql: string; params: unknown[] } {
   const parts: string[] = ["1=1"];
   const params: unknown[] = [];
   let i = paramStart;
@@ -120,22 +121,20 @@ export async function listFoundPage(query: FoundPageQuery): Promise<{
   const offset = (page - 1) * limit;
   const tenantId = currentTenantId();
   const { sql: whereSql, params } = buildWhere(query);
-  const whereWithTenant = `("tenantId" = $1) AND (${whereSql})`;
+  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const sortKey = query.sort && SORT_SQL[query.sort] ? query.sort : "profit";
   const orderSql = SORT_SQL[sortKey];
 
   const countRows = await prisma.$queryRawUnsafe<{ c: bigint }[]>(
     `SELECT COUNT(*)::bigint AS c FROM "FoundProduct" WHERE ${whereWithTenant}`,
-    tenantId,
     ...params
   );
   const total = Number(countRows[0]?.c ?? 0);
 
-  const limitIdx = params.length + 2;
-  const offsetIdx = params.length + 3;
+  const limitIdx = params.length + 1;
+  const offsetIdx = params.length + 2;
   const rows = await prisma.$queryRawUnsafe<{ payload: FinderListing; listingKey: string }[]>(
     `SELECT payload, "listingKey" FROM "FoundProduct" WHERE ${whereWithTenant} ORDER BY ${orderSql} LIMIT $${limitIdx}::int OFFSET $${offsetIdx}::int`,
-    tenantId,
     ...params,
     limit,
     offset
@@ -186,9 +185,9 @@ type FoundStatsRow = {
 async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStatsRow> {
   const tenantId = currentTenantId();
   const { sql: whereSql, params: whereParams } = buildWhere(query);
-  const whereWithTenant = `("tenantId" = $1) AND (${whereSql})`;
+  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const pq = profitParams(query);
-  const i = whereParams.length + 2;
+  const i = whereParams.length + 1;
   const profitable = profitableWhereSql(pq, i);
   const sold = `(NULLIF(payload->>'sold_price', '')::double precision)`;
   const net = netProfitExprSql(i, i + 1);
@@ -216,7 +215,6 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
       COALESCE(SUM((${sold}) * ${qty}), 0)::double precision AS total_revenue
     FROM "FoundProduct"
     WHERE ${whereWithTenant}`,
-    tenantId,
     ...whereParams,
     ...profitable.params
   );

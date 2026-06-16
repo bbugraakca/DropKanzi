@@ -1,4 +1,5 @@
 import { prisma, currentTenantId } from "./db";
+import { sqlTenantWhere } from "./sqlUtils";
 import { mergeListing, activeListingKey, type FinderListing } from "./foundProducts";
 import { Prisma } from "@prisma/client";
 import {
@@ -48,7 +49,7 @@ const SORT_SQL: Record<ActiveSortKey, string> = {
   match: `(payload->>'match_confidence')::double precision DESC NULLS LAST`,
 };
 
-function buildWhere(query: ActivePageQuery, paramStart = 2): { sql: string; params: unknown[] } {
+function buildWhere(query: ActivePageQuery, paramStart = 1): { sql: string; params: unknown[] } {
   const parts: string[] = ["1=1"];
   const params: unknown[] = [];
   let i = paramStart;
@@ -115,22 +116,20 @@ export async function listActivePage(query: ActivePageQuery): Promise<{
   const offset = (page - 1) * limit;
   const tenantId = currentTenantId();
   const { sql: whereSql, params } = buildWhere(query);
-  const whereWithTenant = `("tenantId" = $1) AND (${whereSql})`;
+  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const sortKey = query.sort && SORT_SQL[query.sort] ? query.sort : "profit";
   const orderSql = SORT_SQL[sortKey];
 
   const countRows = await prisma.$queryRawUnsafe<{ c: bigint }[]>(
     `SELECT COUNT(*)::bigint AS c FROM "ActiveListingProduct" WHERE ${whereWithTenant}`,
-    tenantId,
     ...params
   );
   const total = Number(countRows[0]?.c ?? 0);
 
-  const limitIdx = params.length + 2;
-  const offsetIdx = params.length + 3;
+  const limitIdx = params.length + 1;
+  const offsetIdx = params.length + 2;
   const rows = await prisma.$queryRawUnsafe<{ payload: FinderListing; listingKey: string }[]>(
     `SELECT payload, "listingKey" FROM "ActiveListingProduct" WHERE ${whereWithTenant} ORDER BY ${orderSql} LIMIT $${limitIdx}::int OFFSET $${offsetIdx}::int`,
-    tenantId,
     ...params,
     limit,
     offset
@@ -158,9 +157,9 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
 }> {
   const tenantId = currentTenantId();
   const { sql: whereSql, params: whereParams } = buildWhere(query);
-  const whereWithTenant = `("tenantId" = $1) AND (${whereSql})`;
+  const whereWithTenant = `(${sqlTenantWhere(tenantId)}) AND (${whereSql})`;
   const pq = profitParams(query);
-  const i = whereParams.length + 2;
+  const i = whereParams.length + 1;
   const profitable = profitableWhereSql(pq, i);
   const listPrice = `(NULLIF(payload->>'sold_price', '')::double precision)`;
   const net = netProfitExprSql(i, i + 1);
@@ -188,7 +187,6 @@ export async function getActiveStats(query: ActivePageQuery = {}): Promise<{
       COALESCE(SUM((${listPrice})), 0)::double precision AS total_revenue
     FROM "ActiveListingProduct"
     WHERE ${whereWithTenant}`,
-    tenantId,
     ...whereParams,
     ...profitable.params
   );
