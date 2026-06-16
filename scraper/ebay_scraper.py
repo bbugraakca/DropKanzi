@@ -213,9 +213,7 @@ EBAY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
-# ASINs are 10 chars; modern ones are B0XXXXXXXX. Tightened to avoid matching
-# random 10-char tokens in page HTML.
-from asin_util import is_plausible_asin, normalize_asin, _ASIN_LABELED_RE
+from asin_util import normalize_asin
 
 _ASIN_DP_RE = re.compile(r"amazon\.[a-z.]+/(?:dp|gp/product)/([A-Z0-9]{10})", re.IGNORECASE)
 
@@ -843,15 +841,17 @@ def parse_ebay_date(date_str: str) -> Optional[datetime]:
     return None
 
 
-def _extract_asin_from_html(html: str) -> Optional[str]:
+def _extract_asin_from_html(html: str) -> dict | None:
+    """
+    Extract ASIN from eBay listing HTML.
+
+    Only trusts explicit amazon.com/dp/ or /gp/product/ links — eBay page chrome
+    often contains labeled 10-char tokens (e.g. JLZNJLC2HE) that are not ASINs.
+    """
     for m in _ASIN_DP_RE.finditer(html):
         asin = normalize_asin(m.group(1))
         if asin:
-            return asin
-    for m in _ASIN_LABELED_RE.finditer(html):
-        asin = normalize_asin(m.group(1))
-        if asin:
-            return asin
+            return {"asin": asin, "source": "dp_link"}
     return None
 
 
@@ -867,7 +867,7 @@ async def get_listing_details(
             r = await _ebay_get(sess, url, headers=headers, timeout=8)
             if r.status_code != 200:
                 return {}
-            return {"asin": _extract_asin_from_html(r.text)}
+            return _extract_asin_from_html(r.text) or {}
         except Exception:  # noqa: BLE001
             return {}
 

@@ -6,6 +6,7 @@ import { Prisma } from "@prisma/client";
 import { isPlausibleAsin } from "../utils/asin";
 import {
   enrichListingProfit,
+  ACCEPTED_MATCH_SQL,
   HAS_PRICE_SQL,
   minMarginWhereSql,
   minMatchConfidenceWhereSql,
@@ -168,6 +169,8 @@ let statsCache: {
   key: string;
   data: {
     total: number;
+    matched: number;
+    with_price: number;
     missing_prices: number;
     profitable: number;
     total_profit: number;
@@ -187,6 +190,8 @@ export function invalidateFoundStatsCache(): void {
 
 type FoundStatsRow = {
   total: number;
+  matched: number;
+  with_price: number;
   missing_prices: number;
   profitable: number;
   total_profit: number;
@@ -208,6 +213,8 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
   const rows = await prisma.$queryRawUnsafe<
     {
       total: bigint;
+      matched: bigint;
+      with_price: bigint;
       missing_prices: bigint;
       profitable: bigint;
       total_profit: number | null;
@@ -217,6 +224,8 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
   >(
     `SELECT
       COUNT(*)::bigint AS total,
+      COUNT(*) FILTER (WHERE ${ACCEPTED_MATCH_SQL})::bigint AS matched,
+      COUNT(*) FILTER (WHERE ${HAS_PRICE_SQL})::bigint AS with_price,
       COUNT(*) FILTER (
         WHERE payload->>'amazon_asin' IS NOT NULL
           AND (payload->>'amazon_price' IS NULL OR payload->>'amazon_price' = '')
@@ -233,6 +242,8 @@ async function computeFoundStats(query: FoundPageQuery = {}): Promise<FoundStats
   const row = rows[0];
   return {
     total: Number(row?.total ?? 0),
+    matched: Number(row?.matched ?? 0),
+    with_price: Number(row?.with_price ?? 0),
     missing_prices: Number(row?.missing_prices ?? 0),
     profitable: Number(row?.profitable ?? 0),
     total_profit: Math.round(Number(row?.total_profit ?? 0) * 100) / 100,

@@ -31,21 +31,28 @@ function readPageSize(): PageSizeOption {
 
 function buildSummary(stats: {
   total: number;
+  matched: number;
+  with_price: number;
   profitable: number;
+  missing_prices: number;
   total_profit?: number;
   avg_margin?: number;
   total_revenue?: number;
 }): ProductFinderSummary {
   const avgMargin = Math.round((stats.avg_margin ?? 0) * 10) / 10;
+  const matchRate =
+    stats.total > 0 ? Math.round((stats.matched / stats.total) * 1000) / 10 : 0;
   return {
     total_listings: stats.total,
-    matched_to_amazon: stats.total,
+    matched_to_amazon: stats.matched,
     profitable: stats.profitable,
-    match_rate: stats.total > 0 ? 100 : 0,
+    match_rate: matchRate,
     avg_margin: avgMargin,
     total_revenue: stats.total_revenue ?? 0,
     total_profit: stats.total_profit ?? 0,
     truncated: false,
+    with_price: stats.with_price,
+    missing_prices: stats.missing_prices,
   };
 }
 
@@ -83,6 +90,8 @@ export function FoundProductsPanel({
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState({
     total: 0,
+    matched: 0,
+    with_price: 0,
     profitable: 0,
     missing_prices: 0,
     total_profit: 0,
@@ -122,6 +131,8 @@ export function FoundProductsPanel({
   const applyStats = useCallback(
     (s: {
       total: number;
+      matched: number;
+      with_price: number;
       profitable: number;
       missing_prices: number;
       total_profit?: number;
@@ -131,6 +142,8 @@ export function FoundProductsPanel({
       setStats((prev) => {
         const next = {
           total: s.total,
+          matched: s.matched,
+          with_price: s.with_price,
           profitable: s.profitable,
           missing_prices: s.missing_prices,
           total_profit: s.total_profit ?? 0,
@@ -139,6 +152,8 @@ export function FoundProductsPanel({
         };
         if (
           prev.total === next.total &&
+          prev.matched === next.matched &&
+          prev.with_price === next.with_price &&
           prev.profitable === next.profitable &&
           prev.missing_prices === next.missing_prices &&
           prev.total_profit === next.total_profit &&
@@ -177,13 +192,18 @@ export function FoundProductsPanel({
         setLoadError(null);
         setActiveSellerFilter(withProfit.seller);
         if (res.stats) {
+          const st = res.stats;
           applyStats({
             total: res.count,
-            profitable: res.stats.profitable,
-            missing_prices: res.stats.missing_prices,
-            total_profit: res.stats.total_profit,
-            avg_margin: res.stats.avg_margin,
-            total_revenue: res.stats.total_revenue,
+            matched: st.matched ?? st.total ?? res.count,
+            with_price:
+              st.with_price ??
+              Math.max(0, (st.total ?? res.count) - (st.missing_prices ?? 0)),
+            profitable: st.profitable,
+            missing_prices: st.missing_prices,
+            total_profit: st.total_profit,
+            avg_margin: st.avg_margin,
+            total_revenue: st.total_revenue,
           });
         }
         queryRef.current = withProfit;

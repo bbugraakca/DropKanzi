@@ -143,6 +143,15 @@ export function effectiveMatchConfidenceSql(): string {
   )`;
 }
 
+/** Rows with Amazon ASIN accepted at the default 80% bar (or description match). */
+export const ACCEPTED_MATCH_SQL = `(
+  payload->>'amazon_asin' IS NOT NULL
+  AND (
+    payload->>'match_method' = 'description'
+    OR ${effectiveMatchConfidenceSql()} >= 0.8
+  )
+)`;
+
 export function minMatchConfidenceWhereSql(
   minConfidence: number,
   startIdx: number

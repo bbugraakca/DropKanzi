@@ -370,6 +370,9 @@ export type ProductFinderSummary = {
   total_profit: number;
   truncated: boolean;
   truncated_at?: number | null;
+  /** Found/Live server stats — Amazon buy-box prices loaded. */
+  with_price?: number;
+  missing_prices?: number;
   prices_fetched?: boolean;
   prices_loaded?: number;
   match_groups_total?: number;
@@ -575,6 +578,8 @@ export type FoundPageResponse = {
   limit: number;
   stats?: {
     total: number;
+    matched: number;
+    with_price: number;
     missing_prices: number;
     profitable: number;
     total_profit?: number;
@@ -585,6 +590,8 @@ export type FoundPageResponse = {
 
 export type FoundStats = {
   total: number;
+  matched: number;
+  with_price: number;
   missing_prices: number;
   profitable: number;
   total_profit?: number;

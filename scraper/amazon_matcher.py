@@ -38,7 +38,7 @@ from amazon_search import (
 from pack_utils import extract_pack_count
 from llm_provider import get_llm_client
 from vector_cache import lookup_similar, save_match
-from asin_util import is_plausible_asin
+from asin_util import is_plausible_asin, is_ebay_detail_asin, reject_suspicious_ebay_detail_dupes
 from image_match import IMAGE_CHECK_MAX_TEXT, image_match as siglip_match
 
 logger = logging.getLogger("pricehawk.amazon_matcher")
@@ -670,15 +670,17 @@ async def _match_listing_inner(
     if listing_id:
         detail = await get_listing_details(str(listing_id), serp_session)
         detail_asin = detail.get("asin")
-        if detail_asin and _valid_asin(detail_asin):
+        detail_source = str(detail.get("source") or "")
+        if detail_asin and is_ebay_detail_asin(detail_asin, source=detail_source):
+            conf = 0.99 if detail_source == "dp_link" else 0.0
             hit = {
                 **base,
                 "amazon_asin": detail_asin.upper(),
-                "match_confidence": 0.99,
+                "match_confidence": conf,
                 "match_method": "ebay_detail",
             }
             match_cache.set_match(clean, hit)
-            _record_match("ebay_detail", proxy_used=False, bytes_used=0, confidence=0.99)
+            _record_match("ebay_detail", proxy_used=False, bytes_used=0, confidence=conf)
             return _apply_match(listing, hit)
 
     for id_type in ("apple_mpn", "samsung_model", "mpn", "upc"):
@@ -924,6 +926,14 @@ async def match_listings_batch(
                 return res
 
         matched_reps = await asyncio.gather(*[_match_rep(r) for r in representatives])
+
+    matched_reps = reject_suspicious_ebay_detail_dupes(list(matched_reps))
+    rejected = sum(1 for m in matched_reps if m.get("match_method") == "ebay_detail_rejected")
+    if rejected:
+        logger.warning(
+            "Rejected %d ebay_detail match(es) — same ASIN on 3+ listings (template noise)",
+            rejected,
+        )
 
     rep_by_key = {
         clean_query(rep.get("title", "")).lower(): matched
